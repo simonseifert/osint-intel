@@ -23,6 +23,7 @@ Flags: --json  --deep (enable paid Apify enrichment of found LinkedIn URLs).
 Keyless by default; Apify token read from ~/.config/intel/apify_token or $SIGNAL_APIFY_TOKEN.
 Self / authorized / brand / consenting subjects only.
 """
+import base64
 import glob
 import hashlib
 import json
@@ -327,6 +328,15 @@ def mod_media(url):
     return {"module": "media", **page_media(url)}
 
 
+def embed(url):
+    """Fetch an image -> self-contained data: URI, so a headshot embeds in a standalone brief PDF."""
+    raw = _get(url, timeout=20)
+    low = url.lower().split("?")[0]
+    ct = ("image/png" if low.endswith(".png") else "image/webp" if low.endswith(".webp")
+          else "image/gif" if low.endswith(".gif") else "image/jpeg")
+    return "data:" + ct + ";base64," + base64.b64encode(raw).decode()
+
+
 # ---------------- Apify (deep, paid) ----------------
 
 def _apify_token():
@@ -452,6 +462,9 @@ def main(argv=None):
     a = [x for x in argv if not x.startswith("--")]
     if not a:
         print(__doc__)
+        return
+    if a[0] == "embed" and len(a) > 1:
+        print(embed(a[1]))
         return
     if a[0] == "linkedin" and len(a) > 1:
         out = linkedin(a[1])
