@@ -9,6 +9,12 @@ One command that detects the target type and runs the right keyless modules:
     intel "Acme Ltd"     -> GLEIF entity + ownership (company)
     intel "a person + clues"  -> hint to use the /intel akinator resolver (Exa loop)
 
+Pivots (keyless):
+    intel news "<name or company>"        recent global press mentions (GDELT, country-tagged)
+    intel localnews "<name>" <locale>     native local press (hr/rs/ba/si/de/fr/it/us/gb/...)
+    intel court "<name>"                  US federal court dockets + opinions (CourtListener)
+    intel media <profile-or-article-url>  headshot/preview image + title for the brief
+
 Deep (paid, Apify) LinkedIn on demand:
     intel linkedin <profile-or-company-url>     harvestapi (cookieless, ~$0.004)
     intel linkedin-search "title location ..."  people search ($0.10/page)
@@ -29,6 +35,7 @@ import tempfile
 import time
 import urllib.parse
 import urllib.request
+import xml.etree.ElementTree as ET
 
 UA = {"User-Agent": "intel/1.0 (personal osint)"}
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -92,9 +99,24 @@ def mod_username(q, top_sites=300, timeout=8):
                 seen.add(a["url"])
                 uniq.append(a)
         return {"module": "username", "seed": username, "accounts": uniq,
-                "other_ids": sorted(ids - {username}), "tags": sorted(tags)}
+                "other_ids": sorted(ids - {username}), "tags": sorted(tags),
+                "stealer": _hudsonrock("username", username)}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _hudsonrock(kind, value):
+    """Hudson Rock Cavalier: is this email/username in infostealer-malware logs? Keyless GET."""
+    try:
+        d = _json(f"https://cavalier.hudsonrock.com/api/json/v2/osint-tools/search-by-{kind}?"
+                  f"{kind}=" + urllib.parse.quote(value), timeout=12)
+        return {"message": d.get("message"),
+                "user_services": d.get("total_user_services"),
+                "corporate_services": d.get("total_corporate_services"),
+                "stealer_families": sorted({s.get("stealer_family") for s in d.get("stealers", [])
+                                            if isinstance(s, dict) and s.get("stealer_family")})}
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def mod_email(q):
@@ -107,6 +129,7 @@ def mod_email(q):
         if e:
             out["gravatar"] = {"name": e.get("displayName"), "username": e.get("preferredUsername"),
                                "about": e.get("aboutMe"), "location": e.get("currentLocation"),
+                               "avatar": e.get("thumbnailUrl"),  # headshot for the brief
                                "accounts": [{"service": a.get("shortname"), "url": a.get("url")}
                                             for a in e.get("accounts", [])]}
     except Exception:  # noqa: BLE001 (404 = no gravatar)
@@ -120,14 +143,7 @@ def mod_email(q):
                                "fields": d.get("fields", [])}
     except Exception:  # noqa: BLE001
         pass
-    try:
-        d = _json("https://cavalier.hudsonrock.com/api/json/v2/osint-tools/search-by-email?email="
-                  + urllib.parse.quote(q), timeout=12)
-        out["stealer"] = {"message": d.get("message"),
-                          "user_services": d.get("total_user_services"),
-                          "corporate_services": d.get("total_corporate_services")}
-    except Exception:  # noqa: BLE001
-        pass
+    out["stealer"] = _hudsonrock("email", q)
     try:
         p = subprocess.run(["holehe", q, "--only-used", "--no-color"],
                            capture_output=True, text=True, timeout=180)
@@ -169,6 +185,13 @@ def mod_domain(q):
         out["subdomains"] = sorted(subs)[:60]
     except Exception:  # noqa: BLE001
         pass
+    try:  # Wayback: oldest archived snapshot ~ how long the site has existed publicly
+        d = _json("http://web.archive.org/cdx/search/cdx?url=" + urllib.parse.quote(q)
+                  + "&output=json&fl=timestamp&limit=1", timeout=15)
+        if isinstance(d, list) and len(d) > 1:
+            out["first_snapshot"] = d[1][0]
+    except Exception:  # noqa: BLE001
+        pass
     return out
 
 
@@ -193,21 +216,115 @@ def mod_company(q):
 
 def news(query, maxrecords=20):
     """GDELT DOC 2.0: recent news mentioning the query, worldwide + local, keyless.
-    Each article carries its source country so local/regional press surfaces too."""
+    Each article carries its source country (local/regional press surfaces too) and a
+    social image Claude can view for the brief. GDELT rate-limits bursts, so retry once."""
     q = urllib.parse.quote(f'"{query}"' if " " in query else query)
     url = ("https://api.gdeltproject.org/api/v2/doc/doc?query=" + q +
            f"&mode=artlist&maxrecords={maxrecords}&format=json&sort=datedesc")
-    try:
-        d = _json(url, timeout=15)
-    except Exception:  # noqa: BLE001
+    d = None
+    for attempt in range(2):
+        try:
+            d = _json(url, timeout=15)
+            break
+        except Exception:  # noqa: BLE001 (rate-limit returns non-JSON text)
+            if attempt == 0:
+                time.sleep(6)  # GDELT allows ~1 req / 5s per IP; wait past the window
+    if not d:
         return []
     return [{"country": a.get("sourcecountry"), "domain": a.get("domain"),
-             "title": a.get("title"), "url": a.get("url"), "date": a.get("seendate")}
+             "title": a.get("title"), "url": a.get("url"), "date": a.get("seendate"),
+             "image": a.get("socialimage")}
             for a in d.get("articles", [])]
 
 
 def mod_news(query):
     return {"module": "news", "seed": query, "articles": news(query)}
+
+
+_LOCALES = {  # locale -> (hl, gl, ceid) for Google News RSS
+    "us": ("en-US", "US", "US:en"), "gb": ("en-GB", "GB", "GB:en"),
+    "hr": ("hr", "HR", "HR:hr"), "rs": ("sr", "RS", "RS:sr"),
+    "ba": ("bs", "BA", "BA:bs"), "si": ("sl", "SI", "SI:sl"),
+    "de": ("de", "DE", "DE:de"), "fr": ("fr", "FR", "FR:fr"), "it": ("it", "IT", "IT:it"),
+}
+
+
+def google_news(query, locale="us", limit=15):
+    """Google News RSS for one locale — surfaces native local-language press GDELT under-indexes.
+    e.g. locale='hr' pulls Croatian outlets by name. Keyless."""
+    hl, gl, ceid = _LOCALES.get(locale, _LOCALES["us"])
+    url = (f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}"
+           f"&hl={hl}&gl={gl}&ceid={ceid}")
+    try:
+        root = ET.fromstring(_get(url, timeout=12))
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for item in root.iter("item"):
+        src = item.find("source")
+        out.append({"title": (item.findtext("title") or "").strip(), "url": item.findtext("link"),
+                    "date": item.findtext("pubDate"), "locale": locale,
+                    "source": src.text if src is not None else None})
+        if len(out) >= limit:
+            break
+    return out
+
+
+def mod_localnews(query, locale):
+    return {"module": "localnews", "seed": query, "locale": locale,
+            "articles": google_news(query, locale)}
+
+
+def court(query, limit=10):
+    """CourtListener v4 RECAP: US federal dockets + opinions mentioning the query. Keyless."""
+    url = ("https://www.courtlistener.com/api/rest/v4/search/?type=r&order_by=score%20desc&q="
+           + urllib.parse.quote(f'"{query}"' if " " in query else query))
+    try:
+        d = _json(url, timeout=20)
+    except Exception:  # noqa: BLE001
+        return []
+    return [{"case": r.get("caseName"), "court": r.get("court"), "date": r.get("dateFiled"),
+             "docket": r.get("docketNumber"),
+             "url": "https://www.courtlistener.com" + (r.get("absolute_url") or "")}
+            for r in d.get("results", [])[:limit]]
+
+
+def mod_court(query):
+    return {"module": "court", "seed": query, "cases": court(query)}
+
+
+# ---------------- media (headshots / previews, keyless) ----------------
+
+def _meta(html, prop):
+    m = re.search(r'<meta[^>]+(?:property|name)=["\']' + re.escape(prop)
+                  + r'["\'][^>]*content=["\']([^"\']+)', html, re.I)
+    if not m:  # some pages put content= before property=
+        m = re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]*(?:property|name)=["\']'
+                      + re.escape(prop) + r'["\']', html, re.I)
+    return m.group(1) if m else None
+
+
+def page_media(url):
+    """Pull the preview image + title + description a public page advertises about itself
+    (og:/twitter: cards). For a profile/article URL this is usually the headshot or hero
+    image, so Claude can view and analyse it for the brief. No scraping of private content."""
+    try:
+        html = _get(url, timeout=12).decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return {"url": url}
+    title = _meta(html, "og:title") or _meta(html, "twitter:title")
+    if not title:
+        t = re.search(r"<title[^>]*>(.*?)</title>", html, re.I | re.S)
+        title = t.group(1).strip() if t else None
+    img = _meta(html, "og:image") or _meta(html, "twitter:image") or _meta(html, "twitter:image:src")
+    if img and img.startswith("//"):
+        img = "https:" + img
+    return {"url": url, "image": img, "title": title,
+            "description": _meta(html, "og:description") or _meta(html, "description")}
+
+
+def mod_media(url):
+    return {"module": "media", **page_media(url)}
 
 
 # ---------------- Apify (deep, paid) ----------------
@@ -289,12 +406,17 @@ def _print(res):
                 print("  also seen as:", ", ".join(m["other_ids"]))
             if m["tags"]:
                 print("  interests:", ", ".join(m["tags"]))
+            s = m.get("stealer")
+            if s and s.get("user_services"):
+                print(f"  stealer: {s.get('message')} (user svcs {s.get('user_services')})")
             for a in m["accounts"]:
                 print(f"    {a['platform']:20} {a['url']}")
         elif mod == "email":
             g = m.get("gravatar")
             if g:
                 print(f"  gravatar: {g.get('name')} (@{g.get('username')}) {g.get('location') or ''}")
+                if g.get("avatar"):
+                    print(f"    headshot: {g['avatar']}")
                 for a in g.get("accounts", []):
                     print(f"    {a['service']:14} {a['url']}")
             b = m.get("breaches")
@@ -311,6 +433,8 @@ def _print(res):
             w = m.get("whois") or {}
             print(f"  whois: registrar={w.get('registrar')} registered={w.get('registered')} expires={w.get('expires')}")
             print(f"  status: {w.get('status')}  ns: {', '.join(w.get('nameservers') or [])}")
+            if m.get("first_snapshot"):
+                print(f"  first web-archive snapshot: {m['first_snapshot']}")
             print(f"  subdomains ({len(m['subdomains'])}): {', '.join(m['subdomains'][:20])}")
         elif mod == "company":
             for e in m["entities"]:
@@ -335,6 +459,14 @@ def main(argv=None):
         out = linkedin_search(" ".join(a[1:]))
     elif a[0] == "news" and len(a) > 1:
         out = mod_news(" ".join(a[1:]))
+    elif a[0] == "media" and len(a) > 1:
+        out = mod_media(a[1])
+    elif a[0] == "localnews" and len(a) > 1:
+        loc = a[-1] if a[-1] in _LOCALES else "us"
+        q = " ".join(a[1:-1] if a[-1] in _LOCALES else a[1:])
+        out = mod_localnews(q, loc)
+    elif a[0] == "court" and len(a) > 1:
+        out = mod_court(" ".join(a[1:]))
     else:
         out = assemble(" ".join(a), deep=deep)
     if as_json:
