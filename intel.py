@@ -24,6 +24,7 @@ Keyless by default; Apify token read from ~/.config/intel/apify_token or $SIGNAL
 Self / authorized / brand / consenting subjects only.
 """
 import base64
+import difflib
 import glob
 import hashlib
 import json
@@ -238,8 +239,51 @@ def news(query, maxrecords=20):
             for a in d.get("articles", [])]
 
 
+def _registrable(dom_or_url):
+    dom = dom_or_url
+    if "/" in (dom_or_url or ""):
+        dom = urllib.parse.urlparse(dom_or_url).netloc
+    parts = (dom or "").lower().lstrip("www.").split(".")
+    return ".".join(parts[-2:]) if len(parts) >= 2 else (dom or "")
+
+
+def corroboration(articles):
+    """The 'truth factor', deterministic layer. Public info can be planted, and 20 outlets
+    syndicating ONE wire story looks like corroboration but is a single source (circular
+    reporting). This scores how INDEPENDENT a set of items really is: distinct publishers +
+    near-duplicate headline clusters (copy-paste/syndication)."""
+    def norm(t):
+        return re.sub(r"[^a-z0-9 ]", "", (t or "").lower()).strip()
+    domains = {}
+    for a in articles:
+        domains.setdefault(_registrable(a.get("domain") or a.get("url", "")), []).append(a)
+    titles = [(norm(a.get("title")), a) for a in articles if a.get("title")]
+    dups, used = [], set()
+    for i, (ti, ai) in enumerate(titles):
+        if i in used or not ti:
+            continue
+        cluster = [ai.get("domain")]
+        for j in range(i + 1, len(titles)):
+            tj, aj = titles[j]
+            if j not in used and tj and difflib.SequenceMatcher(None, ti, tj).ratio() > 0.85:
+                cluster.append(aj.get("domain"))
+                used.add(j)
+        if len(cluster) > 1:
+            dups.append(cluster)
+    indep = len(domains)
+    weak = indep <= 2 or bool(dups)
+    return {"items": len(articles), "independent_domains": indep,
+            "top_domains": sorted(domains, key=lambda d: -len(domains[d]))[:8],
+            "syndication_clusters": dups,
+            "caution": ("LOW independence: few distinct publishers or heavy syndication; "
+                        "treat as ~1-2 real sources, find the primary." if weak else
+                        "Broader independence across publishers; still trace to the primary source.")}
+
+
 def mod_news(query):
-    return {"module": "news", "seed": query, "articles": news(query)}
+    arts = news(query)
+    return {"module": "news", "seed": query, "articles": arts,
+            "corroboration": corroboration(arts)}
 
 
 _LOCALES = {  # locale -> (hl, gl, ceid) for Google News RSS
@@ -451,6 +495,10 @@ def _print(res):
                 print(f"    {e['name']}  [{e.get('country')}]  LEI {e['lei']}")
             print("  " + m["hint"])
         elif mod == "news":
+            c = m.get("corroboration") or {}
+            if c:
+                print(f"  independence: {c.get('independent_domains')} distinct publishers "
+                      f"of {c.get('items')} items · {c.get('caution')}")
             for a in m["articles"][:15]:
                 print(f"    [{a.get('country', '?')}] {a.get('domain', '')}: {a.get('title', '')[:60]}")
 

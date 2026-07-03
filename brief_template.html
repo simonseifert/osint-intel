@@ -30,6 +30,8 @@
   .timeline li { margin:6px 0; } .timeline b { color:var(--accent); }
   .media { display:flex; flex-wrap:wrap; gap:10px; } .media img { height:96px; border-radius:8px; border:1px solid var(--line); }
   .src { font-size:11.5px; color:var(--sub); } .src a { color:var(--accent); }
+  .legend { font-size:11px; color:var(--sub); margin:10px 2px 0; }
+  .legend .conf { margin-right:3px; }
   .note { font-size:11px; color:var(--sub); margin-top:26px; border-top:1px solid var(--line); padding-top:12px; }
   @media print { .page { padding:24px 30px; } a { color:var(--ink); } }
 </style>
@@ -43,12 +45,17 @@
       <p class="tag">{{ONE_LINE_WHO_THEY_ARE}}</p>
       <div class="chips">{{CHIPS: role · location · employer · notable tag}}</div>
     </div>
-    <div class="meta">INTEL BRIEF<br>{{DATE}}<br>confidence: {{OVERALL_CONFIDENCE}}</div>
+    <div class="meta">INTEL BRIEF<br>{{DATE}}<br>confidence: {{OVERALL_CONFIDENCE}}<br>{{VERIFICATION: e.g. 4 independent sources · skeptic pass run}}</div>
   </header>
 
   <div class="highlights">
     <ul>{{KEY_HIGHLIGHTS: 4-7 punchy bullets — the things that matter most}}</ul>
   </div>
+  <p class="legend"><b>Grading:</b>
+    <span class="conf hi">FACT</span> multi-source / hard anchor ·
+    <span class="conf med">INFERENCE</span> reasoned ·
+    <span class="conf lo">UNVERIFIED</span> single soft source ·
+    <span class="conf lo">DISPUTED</span> sources conflict</p>
 
   <h2>Identity &amp; Presence</h2>
   <table>
@@ -72,10 +79,19 @@
   <h2>Connections</h2>
   <p>{{CONNECTIONS: non-obvious links — associated people, orgs, shared handles/emails, the puzzle pieces joined}}</p>
 
+  <h2>Reliability &amp; disputes</h2>
+  <p>{{RELIABILITY: overall grade + how corroboration was tested — independent-source count
+     (not raw article count), syndication/circular-reporting check, reverse-image on the
+     headshot, negative/refutation search. List DISPUTED claims and unresolved gaps here;
+     do not bury them in the sections above.}}</p>
+
   <h2>Sources</h2>
   <p class="src">{{SOURCES: every tool/site used, with the finding it confirmed — provenance}}</p>
 
-  <p class="note">Assembled from public / authorized sources for {{PURPOSE}}. Finder hits are leads verified before inclusion; absence is not proof. Not for surveillance of private individuals.</p>
+  <p class="note">Assembled from public / authorized sources for {{PURPOSE}}. Claims are graded
+  and adversarially checked for planted / false information; UNVERIFIED and DISPUTED items are
+  labelled, not presented as fact. Finder hits are leads, not proof; absence is not proof. Not
+  for surveillance of private individuals.</p>
 </div>
 </body>
 </html>
