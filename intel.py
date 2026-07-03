@@ -191,6 +191,25 @@ def mod_company(q):
     return out
 
 
+def news(query, maxrecords=20):
+    """GDELT DOC 2.0: recent news mentioning the query, worldwide + local, keyless.
+    Each article carries its source country so local/regional press surfaces too."""
+    q = urllib.parse.quote(f'"{query}"' if " " in query else query)
+    url = ("https://api.gdeltproject.org/api/v2/doc/doc?query=" + q +
+           f"&mode=artlist&maxrecords={maxrecords}&format=json&sort=datedesc")
+    try:
+        d = _json(url, timeout=15)
+    except Exception:  # noqa: BLE001
+        return []
+    return [{"country": a.get("sourcecountry"), "domain": a.get("domain"),
+             "title": a.get("title"), "url": a.get("url"), "date": a.get("seendate")}
+            for a in d.get("articles", [])]
+
+
+def mod_news(query):
+    return {"module": "news", "seed": query, "articles": news(query)}
+
+
 # ---------------- Apify (deep, paid) ----------------
 
 def _apify_token():
@@ -240,12 +259,13 @@ def assemble(query, deep=False):
         res["modules"].append(mod_domain(query))
     elif t == "company":
         res["modules"].append(mod_company(query))
-        res["modules"].append(mod_domain(query.split()[0]) if "." in query else None)
+        res["modules"].append(mod_news(query))
     else:  # person
+        res["modules"].append(mod_news(query))  # local + global news mentions (GDELT)
         res["note"] = ("Person-name detected. Deterministic tools can't resolve a fuzzy name; "
                        "use the /intel skill's akinator loop (Exa neural search + Wikidata + "
                        "Claude reasoning) to converge on candidates, then run `intel <@handle>` "
-                       "on any handle it surfaces.")
+                       "on any handle it surfaces. The news mentions below are a starting pivot.")
     if deep:
         for m in res["modules"]:
             if not m:
@@ -296,6 +316,9 @@ def _print(res):
             for e in m["entities"]:
                 print(f"    {e['name']}  [{e.get('country')}]  LEI {e['lei']}")
             print("  " + m["hint"])
+        elif mod == "news":
+            for a in m["articles"][:15]:
+                print(f"    [{a.get('country', '?')}] {a.get('domain', '')}: {a.get('title', '')[:60]}")
 
 
 def main(argv=None):
@@ -310,6 +333,8 @@ def main(argv=None):
         out = linkedin(a[1])
     elif a[0] == "linkedin-search" and len(a) > 1:
         out = linkedin_search(" ".join(a[1:]))
+    elif a[0] == "news" and len(a) > 1:
+        out = mod_news(" ".join(a[1:]))
     else:
         out = assemble(" ".join(a), deep=deep)
     if as_json:
