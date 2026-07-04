@@ -465,12 +465,21 @@ def permute_usernames(name):
 
 
 def _github_user(u):
-    """GitHub's public user API as a cheap keyless 'does this handle exist' anchor."""
+    """GitHub public user API. Surfaces the fields you actually verify identity with (avatar,
+    blog, location, twitter, repos, created) - NOT just follower count. `identifying_signal`
+    is False for a ghost account (no name/bio/blog/location/twitter/repos): a ghost can't be
+    confirmed OR denied from OSINT, so callers must mark it UNVERIFIED, never 'not them'."""
     try:
         d = _json(f"https://api.github.com/users/{urllib.parse.quote(u)}", timeout=8)
         if isinstance(d, dict) and d.get("login"):
+            sig = any([d.get("name"), d.get("bio"), d.get("blog"), d.get("location"),
+                       d.get("twitter_username"), d.get("public_repos")])
             return {"login": d["login"], "name": d.get("name"), "bio": d.get("bio"),
-                    "url": d.get("html_url"), "followers": d.get("followers")}
+                    "url": d.get("html_url"), "followers": d.get("followers"),
+                    "repos": d.get("public_repos"), "blog": d.get("blog") or None,
+                    "location": d.get("location"), "twitter": d.get("twitter_username"),
+                    "avatar": d.get("avatar_url"), "created": (d.get("created_at") or "")[:10],
+                    "identifying_signal": sig}
     except Exception:  # noqa: BLE001 (404 = no such user)
         pass
     return None
@@ -479,8 +488,13 @@ def _github_user(u):
 def mod_handles(name):
     cands = permute_usernames(name)
     gh = [r for u in cands if (r := _github_user(u))]
+    ghosts = [r["login"] for r in gh if not r["identifying_signal"]]
     return {"module": "handles", "seed": name, "candidates": cands, "github_hits": gh,
-            "hint": "Run `intel <@candidate>` (maigret, 3000+ sites) on the promising handles."}
+            "ghost_accounts": ghosts,
+            "hint": ("Verify handles WITH identifying_signal via avatar-match, linked site, or a "
+                     "link from a known profile. Ghost accounts " + (str(ghosts) if ghosts else "[]")
+                     + " have no name/bio/repos/avatar: OSINT can't confirm or deny them, so mark "
+                     "them UNVERIFIED, never 'not them' (that needs contradicting evidence).")}
 
 
 # ---------------- archive / tamper detection ----------------

@@ -71,6 +71,21 @@ identity table with a confidence chip per row, media, timeline, sources, and a r
 section. Fill the `{{...}}` slots, embed a headshot with `intel embed`, and export to PDF
 with any headless browser's print-to-PDF.
 
+## 🤖 Use it as a Claude Code skill (optional)
+
+The CLI is the tool; the **skill** is the agent that knows how to drive it well — open-minded
+pivoting, the akinator resolver, the verification pass, and writing the brief. It lives in
+[`skill/`](skill/).
+
+```bash
+mkdir -p ~/.claude/skills/intel
+cp skill/SKILL.md skill/brief_template.html ~/.claude/skills/intel/
+# make sure `intel` is on PATH (see Install below)
+```
+
+Then in Claude Code: `/intel osint <target>` or "build a brief on <X>". Without the skill you
+still have the full CLI; with it, Claude runs the whole find → verify → grade → brief loop.
+
 ## 🔧 Install
 
 Core is Python 3.9+ **stdlib only**. The finder modules shell out to a few well-known tools:
