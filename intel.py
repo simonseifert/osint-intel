@@ -23,7 +23,7 @@ Deep (paid, Apify) LinkedIn on demand:
     intel linkedin-search "title location ..."  people search ($0.10/page)
 
 Flags: --json  --deep (enable paid Apify enrichment of found LinkedIn URLs).
-Keyless by default; Apify token read from ~/.config/intel/apify_token or $SIGNAL_APIFY_TOKEN.
+Keyless by default; Apify token read from ~/.config/intel/apify_token or $INTEL_APIFY_TOKEN.
 Self / authorized / brand / consenting subjects only.
 """
 import base64
@@ -506,7 +506,7 @@ def mod_archive(url):
 # ---------------- Apify (deep, paid) ----------------
 
 def _apify_token():
-    t = os.environ.get("SIGNAL_APIFY_TOKEN")
+    t = os.environ.get("INTEL_APIFY_TOKEN") or os.environ.get("SIGNAL_APIFY_TOKEN")
     if t:
         return t
     p = os.path.expanduser("~/.config/intel/apify_token")
@@ -516,7 +516,7 @@ def _apify_token():
 def run_actor(actor, run_input, timeout=300):
     tok = _apify_token()
     if not tok:
-        return {"error": "no Apify token (~/.config/intel/apify_token or $SIGNAL_APIFY_TOKEN)"}
+        return {"error": "no Apify token (~/.config/intel/apify_token or $INTEL_APIFY_TOKEN)"}
     aid = actor.replace("/", "~")
     url = f"https://api.apify.com/v2/acts/{aid}/run-sync-get-dataset-items?token={tok}&timeout={timeout}"
     req = urllib.request.Request(url, data=json.dumps(run_input).encode(),
