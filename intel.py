@@ -48,12 +48,16 @@ DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9-]{1,63}\.)+[a-z]{2,}$", re.I)
 _CO_SUFFIX = re.compile(r"\b(inc|ltd|llc|gmbh|corp|co|ag|plc|sarl|s\.?a\.?|d\.?o\.?o\.?|bv|ab|oy|as)\b", re.I)
 
 
-def _get(url, headers=None, timeout=15):
+def _get(url, headers=None, timeout=15, max_bytes=8 * 1024 * 1024):
+    # Only http/https: urllib.urlopen would otherwise open file:// and ftp://, so a
+    # user-supplied URL (intel media/embed/archive) could read local files.
+    if not str(url).lower().startswith(("http://", "https://")):
+        raise ValueError("only http/https URLs are allowed")
     h = dict(UA)
     if headers:
         h.update(headers)
     with urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout) as r:
-        return r.read()
+        return r.read(max_bytes)  # cap: crt.sh / big pages can be huge
 
 
 def _json(url, headers=None, timeout=15):
@@ -79,6 +83,12 @@ def detect(q):
 
 def mod_username(q, top_sites=300, timeout=8):
     username = q.lstrip("@")
+    # Must start alphanumeric so it can't be read as a flag by maigret (argument injection),
+    # and stay within a sane handle charset.
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}", username):
+        return {"module": "username", "seed": username, "accounts": [], "other_ids": [],
+                "tags": [], "stealer": None,
+                "error": "invalid username: start alphanumeric, <=64 chars of letters/digits/._-"}
     tmp = tempfile.mkdtemp(prefix="intel_")
     try:
         subprocess.run(["maigret", username, "--top-sites", str(top_sites), "--timeout",
@@ -89,7 +99,8 @@ def mod_username(q, top_sites=300, timeout=8):
             uid = os.path.basename(f)[len("report_"):-len("_simple.json")]
             ids.add(uid)
             try:
-                data = json.load(open(f))
+                with open(f) as fh:
+                    data = json.load(fh)
             except Exception:  # noqa: BLE001
                 continue
             for site, info in data.items():
@@ -538,7 +549,10 @@ def _apify_token():
     if t:
         return t
     p = os.path.expanduser("~/.config/intel/apify_token")
-    return open(p).read().strip() if os.path.exists(p) else None
+    if os.path.exists(p):
+        with open(p) as fh:
+            return fh.read().strip()
+    return None
 
 
 def run_actor(actor, run_input, timeout=300):
