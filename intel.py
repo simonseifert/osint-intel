@@ -159,6 +159,32 @@ def mod_email(q):
     return out
 
 
+def _whois_cli(domain):
+    """Fallback to the system `whois` for TLDs RDAP does not cover (many ccTLDs, e.g. .hr)."""
+    try:
+        out = subprocess.run(["whois", domain], capture_output=True, text=True, timeout=20).stdout
+    except Exception:  # noqa: BLE001 (whois missing or timed out)
+        return None
+
+    def grab(*keys):
+        for k in keys:
+            m = re.search(rf"(?im)^\s*{re.escape(k)}\s*:\s*(.+)$", out)
+            if m and m.group(1).strip():
+                return m.group(1).strip()
+        return None
+
+    ns = re.findall(r"(?im)^\s*(?:name ?server|nserver)\s*:\s*([^\s,]+)", out)
+    reg = grab("Registrar", "Sponsoring Registrar", "Registrar Name")
+    created = grab("Creation Date", "Created On", "Created", "Registration Date", "Registered On")
+    if not (reg or ns or created):  # nothing parseable -> treat as no data
+        return None
+    return {"domain": domain, "registrar": reg, "registered": created,
+            "expires": grab("Registrar Registration Expiration Date", "Registry Expiry Date",
+                            "Expiration Date", "Expiry Date", "paid-till"),
+            "status": grab("Domain Status", "Status"),
+            "nameservers": sorted({n.lower() for n in ns}) or None}
+
+
 def mod_domain(q):
     out = {"module": "domain", "seed": q, "whois": None, "subdomains": []}
     try:
@@ -179,6 +205,8 @@ def mod_domain(q):
                             "nameservers": [ns.get("ldhName") for ns in d.get("nameservers", [])]}
     except Exception:  # noqa: BLE001
         pass
+    if not out["whois"]:  # RDAP miss (common for ccTLDs like .hr) -> system whois fallback
+        out["whois"] = _whois_cli(q)
     try:
         d = _json(f"https://crt.sh/?q={urllib.parse.quote(q)}&output=json", timeout=25)
         subs = set()
