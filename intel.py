@@ -13,6 +13,9 @@ Pivots (keyless):
     intel news "<name or company>"        recent global press mentions (GDELT, country-tagged)
     intel localnews "<name>" <locale>     native local press (hr/rs/ba/si/de/fr/it/us/gb/...)
     intel court "<name>"                  US federal court dockets + opinions (CourtListener)
+    intel emailguess "First Last" dom.com email-pattern permutations, Gravatar-verified
+    intel handles "First Last"            username permutations, GitHub-existence checked
+    intel archive <url>                   Wayback change-history + live-vs-archive tamper check
     intel media <profile-or-article-url>  headshot/preview image + title for the brief
 
 Deep (paid, Apify) LinkedIn on demand:
@@ -381,6 +384,125 @@ def embed(url):
     return "data:" + ct + ";base64," + base64.b64encode(raw).decode()
 
 
+# ---------------- permutation + verify (the 'approximations' idea) ----------------
+
+def permute_emails(first, last, domain):
+    f, l = re.sub(r"[^a-z]", "", first.lower()), re.sub(r"[^a-z]", "", last.lower())
+    fi, li = (f[:1] or "x"), (l[:1] or "x")
+    pats = [f"{f}.{l}", f"{f}{l}", f"{fi}{l}", f"{f}{li}", f"{fi}.{l}", f"{l}.{f}",
+            f"{l}{f}", f"{f}", f"{f}_{l}", f"{f}-{l}", f"{l}{fi}", f"{fi}{li}", f"{l}.{fi}"]
+    return list(dict.fromkeys(f"{p}@{domain}" for p in pats if p and "@" not in p))
+
+
+def _gravatar_hit(email):
+    """Gravatar as a fast, keyless 'is this a real person's email' verifier (+ their name)."""
+    h = hashlib.md5(email.strip().lower().encode()).hexdigest()
+    try:
+        d = _json(f"https://en.gravatar.com/{h}.json", timeout=8)
+        e = (d.get("entry") or [{}])[0]
+        return e.get("displayName") or e.get("preferredUsername") or "(profile exists)"
+    except Exception:  # noqa: BLE001 (404 = no gravatar)
+        return None
+
+
+def mod_emailguess(name, domain):
+    parts = name.split()
+    cands = permute_emails(parts[0], parts[-1], domain) if len(parts) >= 2 else []
+    hits = [{"email": e, "gravatar": g} for e in cands if (g := _gravatar_hit(e))]
+    return {"module": "emailguess", "seed": f"{name} @ {domain}", "candidates": cands,
+            "gravatar_hits": hits,
+            "hint": "Confirm a candidate with `intel <email>` (holehe + breach + Gravatar)."}
+
+
+def permute_usernames(name):
+    parts = re.sub(r"[^a-z ]", "", name.lower()).split()
+    if len(parts) < 2:
+        b = parts[0] if parts else re.sub(r"[^a-z0-9]", "", name.lower())
+        return list(dict.fromkeys([b, f"{b}1", f"{b}_", f"the{b}"]))
+    f, l = parts[0], parts[-1]
+    fi, li = f[0], l[0]
+    return list(dict.fromkeys([f"{f}{l}", f"{f}.{l}", f"{f}_{l}", f"{fi}{l}", f"{f}{li}",
+                               f"{l}{f}", f"{l}.{f}", f"{l}{fi}", f"{f}", f"{fi}.{l}", f"{f}-{l}"]))
+
+
+def _github_user(u):
+    """GitHub's public user API as a cheap keyless 'does this handle exist' anchor."""
+    try:
+        d = _json(f"https://api.github.com/users/{urllib.parse.quote(u)}", timeout=8)
+        if isinstance(d, dict) and d.get("login"):
+            return {"login": d["login"], "name": d.get("name"), "bio": d.get("bio"),
+                    "url": d.get("html_url"), "followers": d.get("followers")}
+    except Exception:  # noqa: BLE001 (404 = no such user)
+        pass
+    return None
+
+
+def mod_handles(name):
+    cands = permute_usernames(name)
+    gh = [r for u in cands if (r := _github_user(u))]
+    return {"module": "handles", "seed": name, "candidates": cands, "github_hits": gh,
+            "hint": "Run `intel <@candidate>` (maigret, 3000+ sites) on the promising handles."}
+
+
+# ---------------- archive / tamper detection ----------------
+
+def _visible_text(html):
+    html = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", html)
+    return re.sub(r"\s+", " ", re.sub(r"(?s)<[^>]+>", " ", html)).strip()
+
+
+def wayback_timeline(url):
+    # Oldest capture via a bounded CDX query (first-seen / age); latest capture via the
+    # dedicated `available` endpoint (one fast reliable call, unlike a negative-limit CDX scan).
+    first = last = None
+    try:
+        d = _json("http://web.archive.org/cdx/search/cdx?url=" + urllib.parse.quote(url)
+                  + "&output=json&fl=timestamp&limit=1", timeout=15)
+        if isinstance(d, list) and len(d) > 1:
+            first = d[1][0]
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        d = _json("http://archive.org/wayback/available?timestamp=29990101&url="
+                  + urllib.parse.quote(url), timeout=12)
+        last = (((d or {}).get("archived_snapshots") or {}).get("closest") or {}).get("timestamp")
+    except Exception:  # noqa: BLE001
+        pass
+    out = {}
+    if first:
+        out["first"] = first
+    if last:
+        out["last"] = last
+    return out
+
+
+def mod_archive(url):
+    """Wayback change-history + a live-vs-last-archive diff: catches a claim quietly inserted
+    into an old page, or a story edited after the fact (a deception/tamper tripwire)."""
+    out = {"module": "archive", "seed": url, "timeline": wayback_timeline(url)}
+    last = (out["timeline"] or {}).get("last")
+    if last:
+        try:
+            live = _visible_text(_get(url, timeout=15).decode("utf-8", "replace"))[:8000]
+            arch = _visible_text(_get(f"http://web.archive.org/web/{last}id_/{url}",
+                                      timeout=25).decode("utf-8", "replace"))[:8000]
+            r = difflib.SequenceMatcher(None, live, arch).ratio()
+            # A genuine stealth edit leaves most of a page intact (0.3-0.8). A near-zero score
+            # is almost always a render mismatch (JS-rendered live page vs a rendered archive),
+            # not a real edit, so treat it as inconclusive rather than crying tamper.
+            if r < 0.15:
+                note = ("inconclusive: raw live HTML barely overlaps the archive (likely a "
+                        "JS-rendered page); render it with browse/reach before diffing")
+            elif r < 0.8:
+                note = "live page differs from last archive: possible edit/tamper, inspect"
+            else:
+                note = "live page matches last archive"
+            out["live_vs_last_archive"] = {"similarity": round(r, 2), "archived": last, "note": note}
+        except Exception:  # noqa: BLE001
+            pass
+    return out
+
+
 # ---------------- Apify (deep, paid) ----------------
 
 def _apify_token():
@@ -528,6 +650,12 @@ def main(argv=None):
         out = mod_localnews(q, loc)
     elif a[0] == "court" and len(a) > 1:
         out = mod_court(" ".join(a[1:]))
+    elif a[0] == "emailguess" and len(a) > 2:
+        out = mod_emailguess(" ".join(a[1:-1]), a[-1])  # last arg = domain
+    elif a[0] == "handles" and len(a) > 1:
+        out = mod_handles(" ".join(a[1:]))
+    elif a[0] == "archive" and len(a) > 1:
+        out = mod_archive(a[1])
     else:
         out = assemble(" ".join(a), deep=deep)
     if as_json:
