@@ -65,8 +65,7 @@ Explicit LinkedIn (paid Apify, cookieless, your login never used, ~$0.004/lookup
 - `intel linkedin <profile-or-company-url>` - full profile or company page.
 - `intel linkedin-search "title location keywords"` - people search ($0.10/page, deliberate).
 `--deep` also auto-enriches any LinkedIn URL a username scan surfaces.
-Tool: `intel` on PATH (this repo's `intel.py`). Apify token: `INTEL_APIFY_TOKEN` env var or
-`~/.config/intel/apify_token` (chmod 600).
+Tool: `~/Code/personal/intel/intel.py`. Apify token: `~/.config/intel/apify_token`.
 
 ## Investigation loop (find -> verify -> pivot -> fetch -> analyze)
 
@@ -152,8 +151,15 @@ finding as a *claim* with a grade, and run this pass before writing the brief.
    Real corroboration = two sources that could not have copied each other.
 4. **Provenance / age as a deception tripwire.** Freshly created domain (Wayback first-seen,
    already in the domain module) or brand-new account pushing a suspiciously clean narrative
-   is a red flag. Compare the live page against its archived copy (Wayback / archive.today) to
+   is a red flag. Compare the live page against its archived copy (`intel archive <url>`) to
    catch stealth edits, a claim inserted into an old page yesterday is a tell.
+   **Read the age signal's three states literally, never collapse them** (`mod_domain` returns
+   `first_snapshot_status`): `found` = age known; `none` = checked and NOTHING was ever
+   archived, a real red flag worth weighing; `unknown` = the lookup failed, which carries NO
+   information. Write "could not verify age" and infer nothing. Treating `unknown` as `none`
+   invents a red flag; treating `none` as `unknown` hides one. Same rule for the other
+   three-state checks (`archive`'s "inconclusive", the ghost-account identity check): a tool
+   saying "I could not check" is not evidence of absence.
 5. **Media authenticity.** Reverse-image the headshot (browse -> Yandex/Lens): is it stock,
    stolen from someone else, or reused across unrelated "identities"? Run `exiftool` on any
    original image for device/geo/timestamp and to spot stripped or spoofed metadata. Watch for
@@ -200,7 +206,7 @@ a dedicated, independent check whose job is to disbelieve.
 
 A visual dossier: headshot + a tight highlights box + sections + sources, exportable to PDF.
 
-1. Copy the template: `brief_template.html` (in this skill folder / repo).
+1. Copy the template: `~/Code/personal/intel/brief_template.html`.
 2. Fill the `{{...}}` slots from your scratchpad. Sections: highlights (4 to 7 punchy
    bullets, the things that matter most), Identity & Presence (accounts table with a
    confidence chip each), Media (headshot + notable images/clips), Analysis (what the

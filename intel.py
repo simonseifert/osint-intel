@@ -196,6 +196,31 @@ def _whois_cli(domain):
             "nameservers": sorted({n.lower() for n in ns}) or None}
 
 
+def _wayback_first(domain):
+    """Oldest Wayback snapshot for `domain` -> (timestamp_or_None, status).
+
+    Returns a (value, status) pair so callers can tell the three states apart:
+        ("19961231235847", "found")  - archived since then; age is known
+        (None, "none")               - checked, nothing EVER archived. A real signal:
+                                       brand-new or deliberately unarchived domain.
+        (None, "unknown")            - the lookup failed/timed out. NOT a signal.
+                                       The brief must never infer "new domain" from this.
+
+    Deliberately NOT retried: a retry loop (like the GDELT one) would collapse "unknown"
+    back into a guess, which is the whole bug this function exists to prevent.
+    """
+    try:
+        d = _json("http://web.archive.org/cdx/search/cdx?url=" + urllib.parse.quote(domain)
+                  + "&output=json&fl=timestamp&limit=1", timeout=30)
+    except Exception:  # noqa: BLE001 (timeout / rate-limit / junk response)
+        return None, "unknown"  # could not check: the brief must infer NOTHING from this
+    # CDX gives [['timestamp'], ['19961231235847']] when found; [] or a header-only row
+    # when the domain has genuinely never been captured.
+    if isinstance(d, list) and len(d) > 1 and d[1]:
+        return d[1][0], "found"
+    return None, "none"  # checked, nothing ever archived: a real red flag
+
+
 def mod_domain(q):
     out = {"module": "domain", "seed": q, "whois": None, "subdomains": []}
     try:
@@ -229,13 +254,17 @@ def mod_domain(q):
         out["subdomains"] = sorted(subs)[:60]
     except Exception:  # noqa: BLE001
         pass
-    try:  # Wayback: oldest archived snapshot ~ how long the site has existed publicly
-        d = _json("http://web.archive.org/cdx/search/cdx?url=" + urllib.parse.quote(q)
-                  + "&output=json&fl=timestamp&limit=1", timeout=15)
-        if isinstance(d, list) and len(d) > 1:
-            out["first_snapshot"] = d[1][0]
-    except Exception:  # noqa: BLE001
-        pass
+    # Wayback: oldest archived snapshot ~ how long the site has existed publicly. Age is a
+    # deception tripwire (fresh domain + clean narrative = red flag), so the THREE states
+    # must stay distinct, same as archive()'s "inconclusive" and the ghost-account check:
+    #   found        -> timestamp, age known
+    #   no archive   -> REAL signal: nothing ever archived (brand-new / hidden)
+    #   lookup failed-> NO signal: unknown, never infer "new" from it
+    # 30s, not 15: CDX is slow on huge archives (nasa.gov timed out at 15 and the age signal
+    # silently vanished into the same None as "brand-new domain").
+    #
+    # TODO(Simon): set the semantics below — how should mod_domain report these three?
+    out["first_snapshot"], out["first_snapshot_status"] = _wayback_first(q)
     return out
 
 
@@ -510,7 +539,7 @@ def wayback_timeline(url):
     first = last = None
     try:
         d = _json("http://web.archive.org/cdx/search/cdx?url=" + urllib.parse.quote(url)
-                  + "&output=json&fl=timestamp&limit=1", timeout=15)
+                  + "&output=json&fl=timestamp&limit=1", timeout=30)  # slow on big archives
         if isinstance(d, list) and len(d) > 1:
             first = d[1][0]
     except Exception:  # noqa: BLE001
@@ -665,8 +694,14 @@ def _print(res):
             w = m.get("whois") or {}
             print(f"  whois: registrar={w.get('registrar')} registered={w.get('registered')} expires={w.get('expires')}")
             print(f"  status: {w.get('status')}  ns: {', '.join(w.get('nameservers') or [])}")
-            if m.get("first_snapshot"):
+            st = m.get("first_snapshot_status")
+            if st == "found":
                 print(f"  first web-archive snapshot: {m['first_snapshot']}")
+            elif st == "none":
+                print("  first web-archive snapshot: NEVER ARCHIVED — red flag "
+                      "(brand-new or deliberately unarchived domain)")
+            elif st == "unknown":
+                print("  first web-archive snapshot: unknown (lookup failed; infer nothing)")
             print(f"  subdomains ({len(m['subdomains'])}): {', '.join(m['subdomains'][:20])}")
         elif mod == "company":
             for e in m["entities"]:
