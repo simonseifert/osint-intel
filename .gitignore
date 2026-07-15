@@ -10,3 +10,12 @@ __pycache__/
 apify_token
 .config/
 secrets.*
+
+# scan output — THIS REPO IS PUBLIC. Findings about real people must never be pushed.
+# A bare `git add -A` would otherwise stage a dossier sitting in the working dir.
+/*.txt
+/scans/
+/out/
+*.jsonl
+/brief_*.html
+!/brief_template.html
