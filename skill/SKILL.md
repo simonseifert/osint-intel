@@ -424,7 +424,10 @@ is this person's face", which is the surveillance line.
 holehe's last release is 2024-09 and on a 2026-10 test 77 of 123 modules returned
 could-not-check (rate limit / CAPTCHA). Its `used` hits are decent leads; its `not used`
 is weak evidence (a stale module can miss a live account) and `COULD NOT CHECK` is none.
-A sound replacement candidate is `sharsil/mailcat` (active), not yet source-reviewed.
+`sharsil/mailcat` was source-reviewed 2026-10-21 and REJECTED: it answers a different
+question (username -> which mail providers have that mailbox), its Apple check replays a
+hardcoded token against Apple's password-recovery flow, and its SMTP RCPT probes come from
+your own IP. No maintained, clean holehe replacement exists yet; keep holehe + three states.
 HIBP Pwned Passwords (`api.pwnedpasswords.com/range/`) is keyless k-anonymity for password
 checks. HIBP email/domain breach API is $3.50/mo (optional).
 
