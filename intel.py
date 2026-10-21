@@ -20,6 +20,10 @@ Pivots (keyless):
     intel phone <number> [--region=AT]    force phone mode (skips type detection)
                        [--accounts]       + silent Microsoft/Amazon/Zoho existence (phonsint)
     intel media <profile-or-article-url>  headshot/preview image + title for the brief
+    intel capture <url> [--no-wayback]    evidence: raw page + sha256 + UTC + Wayback copy
+    intel sun <lat,lon> <YYYY-MM-DD[THH:MM]> [shadow_bearing]
+                                          sun/shadow geometry; bearing -> UTC time bands
+    intel <github-url | discord-id>       GitHub exposure audit / snowflake account date
 
 Deep (paid, Apify) LinkedIn on demand:
     intel linkedin <profile-or-company-url>     harvestapi (cookieless, ~$0.004)
@@ -30,9 +34,11 @@ Keyless by default; Apify token read from ~/.config/intel/apify_token or $INTEL_
 Self / authorized / brand / consenting subjects only.
 """
 import base64
+import contextlib
 import difflib
 import glob
 import hashlib
+import io
 import json
 import os
 import re
@@ -49,8 +55,27 @@ from html import unescape as html_unescape
 
 UA = {"User-Agent": "intel/1.0 (personal osint)"}
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9-]{1,63}\.)+[a-z]{2,}$", re.I)
-_CO_SUFFIX = re.compile(r"\b(inc|ltd|llc|gmbh|corp|co|ag|plc|sarl|s\.?a\.?|d\.?o\.?o\.?|bv|ab|oy|as)\b", re.I)
+# Labels never start or end with "-": a leading hyphen would reach `whois` as a flag
+# (e.g. "-hevil.com" == "-h evil.com", query an attacker's whois server).
+DOMAIN_RE = re.compile(r"^(?=.{1,253}$)([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+"
+                       r"([a-z]{2,63}|xn--[a-z0-9-]{1,59})$", re.I)
+_CO_SUFFIX = re.compile(r"\b(inc|ltd|llc|gmbh|corp|co|ag|plc|sarl|s\.?a\.?|j\.?d\.?o\.?o\.?|"
+                        r"d\.?o\.?o\.?|d\.?d\.?|s\.?r\.?l\.?|s\.?p\.?a\.?|kft|nv|bv|ab|oy|as|"
+                        r"sp\.? z o\.?o\.?|s\.?r\.?o\.?|ug|kg|obrt)(?!\w)", re.I)
+
+
+class _HttpOnlyRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib follows a 30x to ftp:// by default, so a hostile page could bounce any
+    fetch (spam sites, capture, media) off the http(s)-only check. Refuse that."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not newurl.lower().startswith(("http://", "https://")):
+            raise urllib.error.HTTPError(newurl, code, "blocked non-http(s) redirect",
+                                         headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+urllib.request.install_opener(urllib.request.build_opener(_HttpOnlyRedirects))
 
 
 def _get(url, headers=None, timeout=15, max_bytes=8 * 1024 * 1024):
@@ -71,19 +96,78 @@ def _json(url, headers=None, timeout=15):
 
 # ---------------- detection ----------------
 
-def detect(q):
-    q = q.strip()
+# Profile URLs people paste instead of a handle: host -> (path regex for the handle).
+# The handle is re-validated by mod_username, so a hostile path cannot reach maigret.
+_PROFILE_HOSTS = {
+    "github.com": r"^/([A-Za-z0-9-]{1,39})/?$",
+    "gitlab.com": r"^/([A-Za-z0-9._-]{1,64})/?$",
+    "x.com": r"^/([A-Za-z0-9_]{1,15})/?$", "twitter.com": r"^/([A-Za-z0-9_]{1,15})/?$",
+    "instagram.com": r"^/([A-Za-z0-9._]{1,30})/?$",
+    "tiktok.com": r"^/@([A-Za-z0-9._]{1,24})/?$",
+    "youtube.com": r"^/@([A-Za-z0-9._-]{1,30})/?$",
+    "reddit.com": r"^/(?:u|user)/([A-Za-z0-9_-]{3,20})/?$",
+    "t.me": r"^/([A-Za-z0-9_]{5,32})/?$",
+    "medium.com": r"^/@([A-Za-z0-9._-]{1,30})/?$",
+    "keybase.io": r"^/([A-Za-z0-9_]{2,16})/?$",
+}
+# Discord/X user IDs are "snowflakes": 64-bit ints whose top bits are a millisecond
+# timestamp, so the ID alone dates the account. Pure arithmetic, no lookup.
+_SNOWFLAKE_EPOCHS = {"discord": 1420070400000, "x/twitter": 1288834974657}
+
+
+def classify(q):
+    """(type, normalized value). Strips the wrappers people paste (tel:, mailto:,
+    profile URLs) so each module receives the identifier it expects."""
+    q = (q or "").strip().strip("<>").strip()
+    if not q.strip("@+.-_ "):
+        return "invalid", q
+    low = q.lower()
+    for pre, t in (("tel:", "phone"), ("callto:", "phone"), ("mailto:", "email")):
+        if low.startswith(pre):
+            return t, q[len(pre):].split("?")[0].strip()
+    if re.match(r"^[a-z][a-z0-9+.-]*:", low) and not low.startswith(("http://", "https://")):
+        if not PHONE_RE.match(q):  # "file:", "javascript:" ... never fetch these
+            return "invalid", q
     if q.startswith("@"):
-        return "username"
+        return "username", q
     if EMAIL_RE.match(q):
-        return "email"
-    if PHONE_RE.match(q) and 7 <= len(re.sub(r"\D", "", q)) <= 15:
-        return "phone"  # E.164 allows 15 digits; <7 is a username, not a number
-    if " " not in q and DOMAIN_RE.match(q):
-        return "domain"
+        return "email", q
+    q = re.sub(r"(?i)\s*(?:ext\.?|extension|x|#)\s*\d{1,6}$", "", q) \
+        if PHONE_RE.match(re.sub(r"(?i)\s*(?:ext\.?|extension|x|#)\s*\d{1,6}$", "", q)) else q
+    digits = re.sub(r"\D", "", q)
+    if re.fullmatch(r"\d{17,20}", q):
+        return "snowflake", q
+    if PHONE_RE.match(q) and 7 <= len(digits) <= 15:
+        return "phone", q  # E.164 allows 15 digits; <7 is a username, not a number
+    url = q if low.startswith(("http://", "https://")) else None
+    if not url and "/" in q and " " not in q and DOMAIN_RE.match(q.split("/", 1)[0]):
+        url = "https://" + q
+    if url:
+        u = urllib.parse.urlsplit(url)
+        host = (u.hostname or "").lower().removeprefix("www.").removeprefix("m.")
+        if host in ("discord.com", "discordapp.com"):
+            m = re.match(r"^/users/(\d{17,20})/?$", u.path)
+            if m:
+                return "snowflake", m.group(1)
+        pat = _PROFILE_HOSTS.get(host)
+        m = re.match(pat, u.path) if pat else None
+        if m:
+            return ("github" if host == "github.com" else "username"), m.group(1)
+        return "url", url
+    if " " not in q:
+        try:
+            ascii_q = q.encode("idna").decode() if not q.isascii() else q
+        except UnicodeError:
+            ascii_q = None
+        if ascii_q and DOMAIN_RE.match(ascii_q):
+            return "domain", ascii_q.lower()
     if " " in q or '"' in q:
-        return "company" if _CO_SUFFIX.search(q) else "person"
-    return "username"
+        return ("company" if _CO_SUFFIX.search(q) else "person"), q
+    return "username", q
+
+
+def detect(q):
+    return classify(q)[0]
 
 
 # ---------------- keyless modules ----------------
@@ -96,6 +180,13 @@ def mod_username(q, top_sites=300, timeout=8):
         return {"module": "username", "seed": username, "accounts": [], "other_ids": [],
                 "tags": [], "stealer": None,
                 "error": "invalid username: start alphanumeric, <=64 chars of letters/digits/._-"}
+    if not shutil.which("maigret"):
+        # Never crash and never return an empty list that reads as "no accounts".
+        return {"module": "username", "seed": username, "status": "unavailable",
+                "accounts": [], "other_ids": [], "tags": [],
+                "stealer": _hudsonrock("username", username),
+                "error": "maigret not installed (pipx install maigret); account search "
+                         "NOT run, so the empty list means nothing"}
     tmp = tempfile.mkdtemp(prefix="intel_")
     try:
         subprocess.run(["maigret", username, "--top-sites", str(top_sites), "--timeout",
@@ -114,14 +205,20 @@ def mod_username(q, top_sites=300, timeout=8):
                 if isinstance(info, dict) and info.get("url_user"):
                     for kw in (info.get("keywords") or []):
                         tags.add(kw)
-                    accounts.append({"platform": site, "url": info["url_user"],
+                    u = info["url_user"]
+                    sp = urllib.parse.urlsplit(u)
+                    # A search page or a bare site root proves nothing about the handle:
+                    # maigret reports them as "found" for sites it cannot really check.
+                    weak = (sp.path.strip("/") == "" or bool(re.search(
+                        r"(?i)search|filter|[?&](q|query|s)=", sp.path + "?" + sp.query)))
+                    accounts.append({"platform": site, "url": u, "weak": weak,
                                      "username": info.get("username", uid), "rank": info.get("rank")})
         seen, uniq = set(), []
         for a in sorted(accounts, key=lambda a: a["rank"] if a["rank"] is not None else 9e9):
             if a["url"] not in seen:
                 seen.add(a["url"])
                 uniq.append(a)
-        return {"module": "username", "seed": username, "accounts": uniq,
+        return {"module": "username", "seed": username, "status": "checked", "accounts": uniq,
                 "other_ids": sorted(ids - {username}), "tags": sorted(tags),
                 "stealer": _hudsonrock("username", username)}
     finally:
@@ -167,20 +264,37 @@ def mod_email(q):
     except Exception:  # noqa: BLE001
         pass
     out["stealer"] = _hudsonrock("email", q)
-    try:
-        p = subprocess.run(["holehe", q, "--only-used", "--no-color"],
-                           capture_output=True, text=True, timeout=180)
-        out["accounts"] = [m.group(1) for line in p.stdout.splitlines()
-                           if (m := re.match(r"\[\+\]\s+(\S+)", line.strip()))]
-    except Exception:  # noqa: BLE001
-        pass
+    # holehe prints [+] used / [-] not used / [x] rate-limited or errored. Keep all three:
+    # it was last released 2024-09 and many modules now hit CAPTCHAs or 429s, so "[x]"
+    # (and a stale module's "[-]") is NOT evidence the account does not exist.
+    out["holehe"] = {"status": "unavailable", "used": [], "not_used": 0, "unknown": []}
+    if shutil.which("holehe"):
+        try:
+            p = subprocess.run(["holehe", q, "--no-color"], capture_output=True, text=True,
+                               timeout=180)
+            for line in p.stdout.splitlines():
+                m = re.match(r"\[([+\-x])\]\s+(\S+\.\S+)\s*$", line.strip())
+                if not m:  # also skips holehe's legend lines ("[+] Email used", ...)
+                    continue
+                if m.group(1) == "+":
+                    out["holehe"]["used"].append(m.group(2))
+                elif m.group(1) == "-":
+                    out["holehe"]["not_used"] += 1
+                else:
+                    out["holehe"]["unknown"].append(m.group(2))
+            out["holehe"]["status"] = "checked"
+        except subprocess.TimeoutExpired:
+            out["holehe"]["status"] = "timeout"
+        except Exception as e:  # noqa: BLE001
+            out["holehe"]["status"], out["holehe"]["error"] = "error", str(e)[:200]
+    out["accounts"] = out["holehe"]["used"]
     return out
 
 
 def _whois_cli(domain):
     """Fallback to the system `whois` for TLDs RDAP does not cover (many ccTLDs, e.g. .hr)."""
     try:
-        out = subprocess.run(["whois", domain], capture_output=True, text=True, timeout=20).stdout
+        out = subprocess.run(["whois", "--", domain], capture_output=True, text=True, timeout=20).stdout
     except Exception:  # noqa: BLE001 (whois missing or timed out)
         return None
 
@@ -250,17 +364,32 @@ def mod_domain(q):
         pass
     if not out["whois"]:  # RDAP miss (common for ccTLDs like .hr) -> system whois fallback
         out["whois"] = _whois_cli(q)
+    # Two passive sources, each with its own status, so "crt.sh timed out" (it often
+    # does) never reads as "this domain has no subdomains".
+    subs, out["subdomain_sources"] = set(), {}
     try:
         d = _json(f"https://crt.sh/?q={urllib.parse.quote(q)}&output=json", timeout=25)
-        subs = set()
         for c in d:
             for name in (c.get("name_value", "").split("\n")):
-                name = name.strip().lstrip("*.")
-                if name.endswith(q) and name != q:
+                name = name.strip().lstrip("*.").lower()
+                if name.endswith("." + q):  # not endswith(q): evilexample.com != example.com
                     subs.add(name)
-        out["subdomains"] = sorted(subs)[:60]
+        out["subdomain_sources"]["crt.sh"] = "ok"
     except Exception:  # noqa: BLE001
-        pass
+        out["subdomain_sources"]["crt.sh"] = "failed"
+    if shutil.which("subfinder"):
+        try:
+            p = subprocess.run(["subfinder", "-d", q, "-silent", "-timeout", "20",
+                                "-max-time", "2"], capture_output=True, text=True, timeout=150)
+            subs |= {ln.strip().lower() for ln in p.stdout.splitlines()
+                     if ln.strip().lower().endswith("." + q)}
+            out["subdomain_sources"]["subfinder"] = "ok"
+        except Exception:  # noqa: BLE001
+            out["subdomain_sources"]["subfinder"] = "failed"
+    else:
+        out["subdomain_sources"]["subfinder"] = "unavailable"
+    out["subdomain_count"] = len(subs)
+    out["subdomains"] = sorted(subs)[:100]
     # Wayback: oldest archived snapshot ~ how long the site has existed publicly. Age is a
     # deception tripwire (fresh domain + clean narrative = red flag), so the THREE states
     # must stay distinct, same as archive()'s "inconclusive" and the ghost-account check:
@@ -295,6 +424,10 @@ def mod_company(q):
 
 
 def news(query, maxrecords=20):
+    return _gdelt(query, maxrecords)[0]
+
+
+def _gdelt(query, maxrecords=20):
     """GDELT DOC 2.0: recent news mentioning the query, worldwide + local, keyless.
     Each article carries its source country (local/regional press surfaces too) and a
     social image Claude can view for the brief. GDELT rate-limits bursts, so retry once."""
@@ -309,12 +442,12 @@ def news(query, maxrecords=20):
         except Exception:  # noqa: BLE001 (rate-limit returns non-JSON text)
             if attempt == 0:
                 time.sleep(6)  # GDELT allows ~1 req / 5s per IP; wait past the window
-    if not d:
-        return []
+    if not isinstance(d, dict):
+        return [], "failed"  # rate-limited / down: NOT the same as "no coverage"
     return [{"country": a.get("sourcecountry"), "domain": a.get("domain"),
              "title": a.get("title"), "url": a.get("url"), "date": a.get("seendate"),
              "image": a.get("socialimage")}
-            for a in d.get("articles", [])]
+            for a in d.get("articles", [])], "ok"
 
 
 def _registrable(dom_or_url):
@@ -359,9 +492,21 @@ def corroboration(articles):
 
 
 def mod_news(query):
-    arts = news(query)
-    return {"module": "news", "seed": query, "articles": arts,
-            "corroboration": corroboration(arts)}
+    # Press writes "Hrvatski Telekom", not "Hrvatski Telekom d.d."; an exact-phrase
+    # search WITH the legal suffix finds almost nothing.
+    query = _CO_SUFFIX.sub("", query).strip(" ,.") or query
+    arts, status = _gdelt(query)
+    source = "gdelt"
+    if status != "ok" or not arts:
+        # GDELT 429s bursts from one IP. Fall back to Google News RSS rather than
+        # report a famous company as having no press.
+        arts = [{"country": None, "domain": a.get("source"), "title": a.get("title"),
+                 "url": a.get("url"), "date": a.get("date"), "image": None}
+                for a in google_news(query, "us", limit=20)]
+        source = "google-news-rss (gdelt " + ("failed" if status != "ok" else "empty") + ")"
+        status = "ok" if arts or status == "ok" else "failed"
+    return {"module": "news", "seed": query, "source": source, "status": status,
+            "articles": arts, "corroboration": corroboration(arts)}
 
 
 _LOCALES = {  # locale -> (hl, gl, ceid) for Google News RSS
@@ -429,7 +574,7 @@ _BROWSER_UA = {
 # A phone number once the separators humans type are stripped. Deliberately tighter than
 # "any run of digits": detect() sees a bare token, and a 5-digit string is far likelier a
 # username than something dialable. Explicit `intel phone <n>` bypasses the guess.
-PHONE_RE = re.compile(r"^\+?[0-9][0-9 ().\-/]{5,20}$")
+PHONE_RE = re.compile(r"^\+?\(?[0-9][0-9 ().\-/]{5,20}$")
 
 # phonenumbers' PhoneNumberType -> a label. VOIP/UAN matter for spam triage: they are the
 # cheap, instantly-recyclable, easily-spoofed ranges a call centre actually dials from.
@@ -478,9 +623,22 @@ def _phone_digits(q):
     return s
 
 
+# Everything scraped is attacker-controlled text: a spam-report comment or a page
+# title can carry ANSI escapes (rewrite the terminal, fake output lines) or bidi
+# overrides (make "evil.com" render as something else). Strip C0/C1 controls and
+# bidi/zero-width formatting chars from every scraped string, and again from the
+# whole human-readable report before it reaches the terminal.
+_CTRL = re.compile("[\x00-\x08\x0b-\x1f\x7f-\x9f\u200b-\u200f\u202a-\u202e"
+                   "\u2066-\u2069\ufeff]")
+
+
+def _clean(s):
+    return _CTRL.sub("", s) if isinstance(s, str) else s
+
+
 def _title(body):
     m = re.search(r"<title[^>]*>(.*?)</title>", body, re.S | re.I)
-    return re.sub(r"\s+", " ", html_unescape(m.group(1))).strip() if m else None
+    return _clean(re.sub(r"\s+", " ", html_unescape(m.group(1))).strip()) if m else None
 
 
 def _fetch_final(url, timeout=20, data=None):
@@ -500,7 +658,7 @@ def _html_rows(body):
     rows = []
     for table in re.findall(r"<table.*?</table>", body, re.S | re.I):
         for tr in re.findall(r"<tr.*?</tr>", table, re.S | re.I):
-            cells = [html_unescape(re.sub(r"<[^>]+>", "", c)).strip()
+            cells = [_clean(html_unescape(re.sub(r"<[^>]+>", "", c))).strip()
                      for c in re.findall(r"<t[dh].*?</t[dh]>", tr, re.S | re.I)]
             cells = [c for c in cells if c]
             if cells:
@@ -651,7 +809,7 @@ def _spamcalls(e164):
 def _page_text(body):
     """Visible text of an HTML page, whitespace-collapsed, for anchoring regexes."""
     body = re.sub(r"(?s)<(script|style)[^>]*>.*?</\1>", " ", body)
-    return re.sub(r"\s+", " ", html_unescape(re.sub(r"<[^>]+>", " ", body)))
+    return re.sub(r"\s+", " ", _clean(html_unescape(re.sub(r"<[^>]+>", " ", body))))
 
 
 # Croatian crowd-report sites. Verified 2026-10-13 against a heavily reported HT
@@ -685,7 +843,7 @@ def _tkomezvao(parsed):
         out["spam_votes"], out["ok_votes"] = int(m.group(1)), int(m.group(2))
     out["comments"] = int(c.group(1)) if c else 0
     out["latest"] = [
-        f"{d[8:10]}.{d[5:7]}.{d[:4]}: {html_unescape(re.sub(r'<[^>]+>', '', t)).strip()[:160]}"
+        f"{d[8:10]}.{d[5:7]}.{d[:4]}: {_clean(html_unescape(re.sub(r'<[^>]+>', '', t))).strip()[:160]}"
         for d, t in re.findall(r'<time class="comment-date" datetime="([^"]+)".*?'
                                r'<p class="comment-text-large">(.*?)</p>', body, re.S)][:5]
     return out
@@ -726,20 +884,50 @@ def _telefonbroj(parsed):
     url = f"https://telefonbroj.com/hr/pretraga-telefona/{bare}/"
     out = {"source": "telefonbroj.com", "status": "unknown", "url": url}
     try:
-        status, _, body = _fetch_final(url)
+        status, final, body = _fetch_final(url)
     except Exception:  # noqa: BLE001
+        return out
+    if "match=none" in final:  # unknown number -> search page with "no match"
+        out["status"] = "not_listed"
         return out
     if status != 200:
         return out
-    text = _page_text(body)
-    if "još nema recenzija" in text:
-        out["status"] = "not_listed"
-        return out
-    m = re.search(r"Sve \((\d+)\) Sigurno \((\d+)\) Neutralno \((\d+)\) Opasnost \((\d+)\)", text)
-    if not m:
-        return out
+    # Read the machine-readable layer, not the visible text: the 2026-10 redesign
+    # moved the counts into JS, but kept a schema.org AggregateRating and one
+    # review card per report, classed review-danger / -neutral / -safe.
+    agg = None
+    for blob in re.findall(r'<script type="application/ld\+json">(.*?)</script>', body, re.S):
+        try:
+            d = json.loads(blob)
+        except ValueError:
+            continue
+        if isinstance(d, dict) and d.get("@type") == "AggregateRating":
+            agg = d
+    cards = re.findall(r'review-card review-(danger|neutral|safe|success|warning)[^"]*">\s*'
+                       r'<div class="card-body">\s*<div class="review-text">(.*?)</div>',
+                       body, re.S)
+    # The page ships a hidden JS template card ("__DESC__") even for unknown numbers;
+    # counting it would invent a report for every clean number.
+    cards = [(k, t) for k, t in cards if "__" not in t]
+    if agg and not str(agg.get("ratingCount", "0")).strip("0"):
+        agg = None
+    if not agg and not cards:
+        t = _page_text(body).lower()
+        if "još nema prijava" in t or "još nema recenzija" in t:
+            out["status"] = "not_listed"
+        return out  # layout changed again: unknown, never a silent "clean"
+    kinds = [k for k, _ in cards]
     out["status"] = "listed"
-    out["reports"], out["safe"], out["neutral"], out["dangerous"] = map(int, m.groups())
+    out["reports"] = int(agg["ratingCount"]) if agg and str(agg.get("ratingCount", "")).isdigit() \
+        else len(cards)
+    if agg and agg.get("ratingValue"):
+        out["verdict"] = f"{agg['ratingValue']}/5"
+    out["dangerous"] = kinds.count("danger")
+    out["neutral"] = kinds.count("neutral") + kinds.count("warning")
+    out["safe"] = kinds.count("safe") + kinds.count("success")
+    out["latest"] = [f"[{k}] " + re.sub(r"\s+", " ", _clean(html_unescape(
+                         re.sub(r"<[^>]+>", " ", t)))).strip()[:160]
+                     for k, t in cards[:5]]
     return out
 
 
@@ -1133,12 +1321,263 @@ def linkedin_search(query, limit=10):
                               {"searchQuery": query, "maxItems": limit})}
 
 
+# ---------------- evidence capture ----------------
+
+_EVIDENCE_DIR = os.path.expanduser("~/.local/share/intel/evidence")
+
+
+def capture(url, wayback=True):
+    """Preserve a page as evidence: raw bytes + sha256 + UTC time + response headers,
+    and ask the Wayback Machine for an independent third-party copy. Appends one line
+    to evidence/log.jsonl (append-only: dead ends get logged too, not just hits)."""
+    if not url.lower().startswith(("http://", "https://")):
+        return {"module": "capture", "url": url, "error": "http(s) URLs only"}
+    ts = time.strftime("%Y%m%dT%H%M%SZ", time.gmtime())
+    host = re.sub(r"[^A-Za-z0-9.-]", "_", urllib.parse.urlsplit(url).hostname or "x")[:60]
+    d = os.path.join(_EVIDENCE_DIR, f"{ts}_{host}")
+    os.makedirs(d, exist_ok=True)
+    out = {"module": "capture", "url": url, "retrieved_at": ts, "dir": d}
+    try:
+        req = urllib.request.Request(url, headers=dict(_BROWSER_UA))
+        with urllib.request.urlopen(req, timeout=30) as r:
+            body = r.read(16 * 1024 * 1024)
+            out.update(status=r.status, final_url=r.geturl(),
+                       content_type=r.headers.get("Content-Type"))
+            headers = dict(r.headers.items())
+        with open(os.path.join(d, "page.bin"), "wb") as fh:
+            fh.write(body)
+        with open(os.path.join(d, "headers.json"), "w") as fh:
+            json.dump(headers, fh, indent=1)
+        out["sha256"] = hashlib.sha256(body).hexdigest()
+        out["bytes"] = len(body)
+        out["title"] = _title(body.decode("utf-8", "replace"))
+    except Exception as e:  # noqa: BLE001
+        out["error"] = f"fetch failed: {str(e)[:200]}"
+    if wayback:
+        # Save Page Now, anonymous tier: slow and rate-limited, but the copy is held by a
+        # party with no stake in the investigation, which is what makes it citable.
+        try:
+            req = urllib.request.Request("https://web.archive.org/save/" + url,
+                                         headers=dict(_BROWSER_UA))
+            with urllib.request.urlopen(req, timeout=90) as r:
+                loc = r.headers.get("Content-Location") or r.geturl()
+            out["archive_url"] = (loc if loc.startswith("http")
+                                  else "https://web.archive.org" + loc)
+        except Exception as e:  # noqa: BLE001
+            out["archive_url"] = None
+            out["archive_error"] = str(e)[:160]
+    with open(os.path.join(_EVIDENCE_DIR, "log.jsonl"), "a") as fh:
+        fh.write(json.dumps({k: v for k, v in out.items() if k != "module"}) + "\n")
+    return out
+
+
+# ---------------- sun position (chronolocation) ----------------
+
+def _sun_position(lat, lon, t):
+    """Solar azimuth (deg from north, clockwise) and elevation for a UTC epoch t.
+    NOAA's simplified algorithm; ~0.5 deg, plenty for shadow work, no dependencies."""
+    import math
+    jd = t / 86400.0 + 2440587.5
+    jc = (jd - 2451545.0) / 36525.0
+    l0 = (280.46646 + jc * (36000.76983 + jc * 0.0003032)) % 360
+    m = 357.52911 + jc * (35999.05029 - 0.0001537 * jc)
+    e = 0.016708634 - jc * (0.000042037 + 0.0000001267 * jc)
+    rm = math.radians(m)
+    c = (math.sin(rm) * (1.914602 - jc * (0.004817 + 0.000014 * jc))
+         + math.sin(2 * rm) * (0.019993 - 0.000101 * jc) + math.sin(3 * rm) * 0.000289)
+    lam = l0 + c - 0.00569 - 0.00478 * math.sin(math.radians(125.04 - 1934.136 * jc))
+    eps0 = 23 + (26 + (21.448 - jc * (46.815 + jc * (0.00059 - jc * 0.001813))) / 60) / 60
+    eps = eps0 + 0.00256 * math.cos(math.radians(125.04 - 1934.136 * jc))
+    decl = math.asin(math.sin(math.radians(eps)) * math.sin(math.radians(lam)))
+    y = math.tan(math.radians(eps / 2)) ** 2
+    l0r = math.radians(l0)
+    eqt = 4 * math.degrees(y * math.sin(2 * l0r) - 2 * e * math.sin(rm)
+                           + 4 * e * y * math.sin(rm) * math.cos(2 * l0r)
+                           - 0.5 * y * y * math.sin(4 * l0r) - 1.25 * e * e * math.sin(2 * rm))
+    minutes = (t % 86400) / 60.0
+    tst = (minutes + eqt + 4 * lon) % 1440
+    ha = math.radians(tst / 4 - 180)
+    la = math.radians(lat)
+    cz = math.sin(la) * math.sin(decl) + math.cos(la) * math.cos(decl) * math.cos(ha)
+    zen = math.acos(max(-1.0, min(1.0, cz)))
+    elev = 90 - math.degrees(zen)
+    az = math.degrees(math.atan2(math.sin(ha),
+                                 math.cos(ha) * math.sin(la) - math.tan(decl) * math.cos(la)))
+    return (az + 180) % 360, elev
+
+
+def mod_sun(latlon, when, shadow_az=None):
+    """`intel sun 45.33,14.44 2026-07-01T10:30` -> sun azimuth/elevation and the shadow
+    it casts. With a measured shadow bearing: `intel sun 45.33,14.44 2026-07-01 312`
+    -> the UTC time bands that day when shadows pointed that way."""
+    import math
+    try:
+        lat, lon = (float(x) for x in latlon.split(","))
+        assert -90 <= lat <= 90 and -180 <= lon <= 180
+    except Exception:  # noqa: BLE001
+        return {"module": "sun", "error": "location must be 'lat,lon' in decimal degrees"}
+    import calendar
+    try:
+        fmt = "%Y-%m-%dT%H:%M" if "T" in when else "%Y-%m-%d"
+        t0 = calendar.timegm(time.strptime(when, fmt))
+    except ValueError:
+        return {"module": "sun", "error": "time must be YYYY-MM-DD or YYYY-MM-DDTHH:MM (UTC)"}
+    out = {"module": "sun", "lat": lat, "lon": lon, "when_utc": when}
+    if "T" in when:
+        az, el = _sun_position(lat, lon, t0)
+        out.update(sun_azimuth=round(az, 1), sun_elevation=round(el, 1),
+                   shadow_azimuth=round((az + 180) % 360, 1),
+                   shadow_length_per_unit_height=round(1 / math.tan(math.radians(el)), 2)
+                   if el > 0.5 else None)
+    if shadow_az is not None:
+        target = float(shadow_az) % 360
+        hits = []
+        for minute in range(0, 1440):
+            az, el = _sun_position(lat, lon, t0 + minute * 60)
+            diff = abs(((az + 180) % 360 - target + 180) % 360 - 180)
+            if el > 0 and diff <= 3:
+                hits.append(minute)
+        bands, start = [], None
+        for i, mnt in enumerate(hits):
+            if start is None:
+                start = mnt
+            if i == len(hits) - 1 or hits[i + 1] != mnt + 1:
+                bands.append(f"{start // 60:02d}:{start % 60:02d}-{mnt // 60:02d}:{mnt % 60:02d}")
+                start = None
+        out["shadow_azimuth_measured"] = target
+        out["utc_time_bands"] = bands
+    out["note"] = ("UTC times. +-3 deg bearing tolerance. Measure the shadow bearing on a map "
+                   "(Google Earth ruler) against a straight edge; near solar noon shadows "
+                   "change slowly, so bands widen there. A band is an inference, not a fact: "
+                   "cross-check weather, vegetation and posters.")
+    return out
+
+
+# ---------------- snowflake IDs (Discord / X) ----------------
+
+def mod_snowflake(q):
+    """Decode a 64-bit snowflake ID into its creation time. No network: the timestamp is
+    in the ID itself, which is why a bare Discord user ID already dates the account."""
+    n = int(q)
+    now = time.time() * 1000
+    out = {"module": "snowflake", "seed": q, "readings": []}
+    for platform, epoch in _SNOWFLAKE_EPOCHS.items():
+        ms = (n >> 22) + epoch
+        plausible = epoch <= ms <= now
+        out["readings"].append({
+            "platform": platform, "plausible": plausible,
+            "created_utc": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime(ms / 1000))
+            if plausible else None})
+    out["note"] = ("The ID dates an account/message/server; it names no one. Discord has no "
+                   "keyless profile lookup: the username, avatar and banner need a bot "
+                   "token (GET /users/{id}) or a client you are logged into. Both readings "
+                   "are shown when both are plausible; context decides which platform it is.")
+    return out
+
+
+# ---------------- GitHub (public profile exposure) ----------------
+
+def _gh_headers():
+    tok = os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN")
+    if not tok and shutil.which("gh"):
+        try:
+            tok = subprocess.run(["gh", "auth", "token"], capture_output=True, text=True,
+                                 timeout=5).stdout.strip()
+        except Exception:  # noqa: BLE001
+            tok = None
+    h = {"Accept": "application/vnd.github+json"}
+    if tok:
+        h["Authorization"] = f"Bearer {tok}"
+    return h
+
+
+def mod_github(user, max_repos=5):
+    """What a GitHub account publicly exposes: profile fields, linked socials, orgs,
+    and the author identities in its own commits (the classic self-audit finding: a
+    real email in commit metadata long after the profile email was hidden)."""
+    out = {"module": "github", "seed": user, "profile": None, "socials": [], "orgs": [],
+           "commit_identities": [], "ssh_keys": 0, "gpg_emails": []}
+    if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", user):
+        out["error"] = "invalid GitHub username"
+        return out
+    h = _gh_headers()
+    base = "https://api.github.com/users/" + user
+    try:
+        p = _json(base, headers=h, timeout=12)
+    except urllib.error.HTTPError as e:
+        out["status"] = "not_found" if e.code == 404 else "unknown"
+        out["error"] = f"HTTP {e.code}"
+        return out
+    except Exception as e:  # noqa: BLE001
+        out["status"], out["error"] = "unknown", str(e)[:200]
+        return out
+    out["status"] = "found"
+    out["profile"] = {k: _clean(p.get(k)) for k in (
+        "login", "id", "type", "name", "company", "blog", "location", "email", "bio",
+        "twitter_username", "hireable", "public_repos", "public_gists", "followers",
+        "following", "created_at", "updated_at")}
+    out["profile"]["avatar"] = p.get("avatar_url")
+
+    def _try(url, default):
+        try:
+            return _json(url, headers=h, timeout=12)
+        except Exception:  # noqa: BLE001 (one failed facet must not sink the module)
+            return default
+    out["socials"] = [{"provider": x.get("provider"), "url": _clean(x.get("url"))}
+                      for x in _try(base + "/social_accounts", []) if isinstance(x, dict)]
+    out["orgs"] = [o.get("login") for o in _try(base + "/orgs", []) if isinstance(o, dict)]
+    out["gpg_emails"] = sorted({e.get("email") for k in _try(base + "/gpg_keys", [])
+                                if isinstance(k, dict) for e in k.get("emails") or []
+                                if e.get("email")})
+    try:
+        out["ssh_keys"] = len([ln for ln in _get(f"https://github.com/{user}.keys",
+                                                 timeout=10).splitlines() if ln.strip()])
+    except Exception:  # noqa: BLE001
+        out["ssh_keys"] = None
+    # Commit identities: own (non-fork) repos, most recently pushed first. The events
+    # API stopped carrying commit lists in 2025, so read commits per repo instead.
+    repos = _try(base + "/repos?type=owner&sort=pushed&per_page=30", [])
+    seen = {}
+    for r in [r for r in repos if isinstance(r, dict) and not r.get("fork")][:max_repos]:
+        commits = _try(f"https://api.github.com/repos/{r['full_name']}/commits"
+                       f"?author={user}&per_page=30", [])
+        for c in commits if isinstance(commits, list) else []:
+            a = (c.get("commit") or {}).get("author") or {}
+            key = (a.get("name"), a.get("email"))
+            if a.get("email") and key not in seen:
+                seen[key] = {"name": _clean(a.get("name")), "email": _clean(a.get("email")),
+                             "noreply": a["email"].endswith("users.noreply.github.com"),
+                             "first_seen_in": r["full_name"], "date": a.get("date")}
+    out["commit_identities"] = list(seen.values())
+    out["note"] = ("Commit names/emails are self-asserted by whoever ran `git commit` and "
+                   "can be anything; treat them as leads, grade C. A real address here "
+                   "is the self-audit fix: set a noreply email and rewrite nothing public.")
+    return out
+
+
 # ---------------- assemble + CLI ----------------
 
 def assemble(query, deep=False, region=None):
-    t = detect(query)
+    t, value = classify(query)
     res = {"query": query, "detected": t, "modules": []}
-    if t == "username":
+    if value != query.strip():
+        res["normalized"] = value
+    query = value
+    if t == "invalid":
+        res["error"] = ("not a usable identifier (empty, or a non-web URI scheme); give an "
+                        "email, @handle, phone, domain, profile URL, company or name")
+    elif t == "github":
+        res["modules"].append(mod_github(query))
+        res["modules"].append(mod_username(query))
+    elif t == "snowflake":
+        res["modules"].append(mod_snowflake(query))
+    elif t == "url":
+        host = urllib.parse.urlsplit(query).hostname or ""
+        res["modules"].append(mod_media(query))
+        res["modules"].append(mod_domain(host.lower().removeprefix("www.")))
+        res["note"] = ("URL: showing the page's preview card and its domain. For change "
+                       "history / stealth edits run `intel archive <url>`.")
+    elif t == "username":
         res["modules"].append(mod_username(query))
     elif t == "email":
         res["modules"].append(mod_email(query))
@@ -1163,26 +1602,50 @@ def assemble(query, deep=False, region=None):
                 if isinstance(a, dict) and "linkedin.com/in/" in a.get("url", ""):
                     a["linkedin"] = linkedin(a["url"]).get("data")
     res["modules"] = [m for m in res["modules"] if m]
+    # Evidence hygiene: every result says WHEN it was observed. Pages change and vanish;
+    # a finding without a retrieval time cannot be re-checked or defended later.
+    res["retrieved_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    for m in res["modules"]:
+        if isinstance(m, dict):
+            m.setdefault("retrieved_at", res["retrieved_at"])
     return res
 
 
 def _print(res):
     print(f"\nINTEL: {res['query']}   (detected: {res['detected']})")
+    if res.get("normalized"):
+        print(f"  normalized to: {res['normalized']}")
+    if res.get("error"):
+        print("  ! " + res["error"])
     if res.get("note"):
         print("  " + res["note"])
     for m in res["modules"]:
         mod = m["module"]
         print(f"\n[{mod}]")
         if mod == "username":
+            if m.get("error"):
+                print("  ! " + m["error"])
+            elif m.get("status") == "checked" and not m["accounts"]:
+                print("  maigret found no accounts (absence is not proof: sites block, "
+                      "rename, or hide profiles)")
             if m["other_ids"]:
                 print("  also seen as:", ", ".join(m["other_ids"]))
             if m["tags"]:
                 print("  interests:", ", ".join(m["tags"]))
             s = m.get("stealer")
             if s and s.get("user_services"):
-                print(f"  stealer: {s.get('message')} (user svcs {s.get('user_services')})")
-            for a in m["accounts"]:
+                print(f"  stealer: {s.get('user_services')} stealer-log credentials use this "
+                      f"HANDLE string. Username-only match: common handles collide, so "
+                      f"this is a lead about the string, not proof about the person.")
+            strong = [a for a in m["accounts"] if not a.get("weak")]
+            weak = [a for a in m["accounts"] if a.get("weak")]
+            if m["accounts"]:
+                print(f"  {len(strong)} profile hits (handle EXISTS there; same person is "
+                      f"unverified) + {len(weak)} search/root pages (no evidence):")
+            for a in strong:
                 print(f"    {a['platform']:20} {a['url']}")
+            if weak:
+                print("    weak: " + ", ".join(a["platform"] for a in weak))
         elif mod == "email":
             g = m.get("gravatar")
             if g:
@@ -1199,6 +1662,14 @@ def _print(res):
             s = m.get("stealer")
             if s:
                 print(f"  stealer: {s.get('message')} (user svcs {s.get('user_services')}, corp {s.get('corporate_services')})")
+            hh = m.get("holehe") or {}
+            if hh.get("status") == "checked":
+                print(f"  holehe: used on {len(hh['used'])}, not used on {hh['not_used']}, "
+                      f"COULD NOT CHECK {len(hh['unknown'])} (rate-limit/CAPTCHA; stale "
+                      f"tool, so 'not used' is weak evidence)")
+            elif hh:
+                print(f"  holehe: {hh.get('status')} (registration check NOT run; "
+                      f"no inference)")
             if m.get("accounts"):
                 print("  registered on:", ", ".join(m["accounts"]))
         elif mod == "domain":
@@ -1213,7 +1684,9 @@ def _print(res):
                       "(brand-new or deliberately unarchived domain)")
             elif st == "unknown":
                 print("  first web-archive snapshot: unknown (lookup failed; infer nothing)")
-            print(f"  subdomains ({len(m['subdomains'])}): {', '.join(m['subdomains'][:20])}")
+            src = " ".join(f"{k}:{v}" for k, v in (m.get("subdomain_sources") or {}).items())
+            print(f"  subdomains ({m.get('subdomain_count', len(m['subdomains']))}; {src}): "
+                  f"{', '.join(m['subdomains'][:20])}")
         elif mod == "phone":
             p = m["parsed"]
             v = {True: "valid", False: "INVALID", None: "validity unknown"}[p.get("valid")]
@@ -1272,7 +1745,45 @@ def _print(res):
             for e in m["entities"]:
                 print(f"    {e['name']}  [{e.get('country')}]  LEI {e['lei']}")
             print("  " + m["hint"])
+        elif mod == "github":
+            if m.get("status") != "found":
+                print(f"  {m.get('status')}: {m.get('error')}")
+                continue
+            p = m["profile"]
+            print(f"  {p['login']} (id {p['id']}, {p['type']})  created {p['created_at']}  "
+                  f"updated {p['updated_at']}")
+            for k in ("name", "company", "blog", "location", "email", "bio",
+                      "twitter_username"):
+                if p.get(k):
+                    print(f"  {k:16} {str(p[k])[:120]}")
+            print(f"  repos {p['public_repos']} · gists {p['public_gists']} · followers "
+                  f"{p['followers']} · following {p['following']} · ssh keys {m['ssh_keys']}")
+            for x in m["socials"]:
+                print(f"  social: {x['provider']} {x['url']}")
+            if m["orgs"]:
+                print("  orgs: " + ", ".join(m["orgs"]))
+            if m["gpg_emails"]:
+                print("  gpg key emails: " + ", ".join(m["gpg_emails"]))
+            for c in m["commit_identities"]:
+                tag = "noreply" if c["noreply"] else "REAL ADDRESS"
+                print(f"  commit identity: {c['name']} <{c['email']}>  [{tag}] "
+                      f"in {c['first_seen_in']}")
+            print("  " + m["note"])
+        elif mod == "snowflake":
+            for r in m["readings"]:
+                print(f"  as {r['platform']:10} " + (f"created {r['created_utc']} UTC"
+                      if r["plausible"] else "implausible (date outside platform life)"))
+            print("  " + m["note"])
+        elif mod == "media":
+            for k in ("title", "image", "url", "error"):
+                if m.get(k):
+                    print(f"  {k:6} {str(m[k])[:150]}")
         elif mod == "news":
+            if m.get("status") == "failed":
+                print("  news lookup FAILED (rate-limited/down): no information either "
+                      "way, retry later")
+                continue
+            print(f"  source: {m.get('source', 'gdelt')}")
             c = m.get("corroboration") or {}
             if c:
                 print(f"  independence: {c.get('independent_domains')} distinct publishers "
@@ -1313,6 +1824,10 @@ def main(argv=None):
         out = mod_emailguess(" ".join(a[1:-1]), a[-1])  # last arg = domain
     elif a[0] == "handles" and len(a) > 1:
         out = mod_handles(" ".join(a[1:]))
+    elif a[0] == "capture" and len(a) > 1:
+        out = capture(a[1], wayback="--no-wayback" not in argv)
+    elif a[0] == "sun" and len(a) > 2:
+        out = mod_sun(a[1], a[2], a[3] if len(a) > 3 else None)
     elif a[0] == "archive" and len(a) > 1:
         out = mod_archive(a[1])
     elif a[0] == "phone" and len(a) > 1:
@@ -1324,11 +1839,15 @@ def main(argv=None):
     else:
         out = assemble(" ".join(a), deep=deep, region=region)
     if as_json:
-        print(json.dumps(out, indent=2, ensure_ascii=False))
+        # json escapes C0 controls itself, but not C1 or bidi overrides
+        print(_clean(json.dumps(out, indent=2, ensure_ascii=False)))
     elif "module" in out:
-        print(json.dumps(out.get("data", out), indent=2, ensure_ascii=False)[:4000])
+        print(_clean(json.dumps(out.get("data", out), indent=2, ensure_ascii=False)[:4000]))
     else:
-        _print(out)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            _print(out)
+        sys.stdout.write(_clean(buf.getvalue()).replace("\r", ""))
 
 
 if __name__ == "__main__":

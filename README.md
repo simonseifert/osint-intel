@@ -32,7 +32,10 @@ One entry point. It figures out the target type and dispatches:
 | `intel <email>` | Gravatar profile + LeakCheck breach sources + Hudson Rock stealer exposure + holehe |
 | `intel <@username>` | maigret across 3000+ sites + Hudson Rock username exposure |
 | `intel <+43...>` / `intel phone <n>` | libphonenumber identity (validity, carrier, line type, tz) + official number-block allocation (AT/RTR, incl. premium-range service provider name+address) + crowd spam reports (exact-match guarded; spamcalls + telefonbroj everywhere, tko-me-zvao.com.hr + ciji-broj.hr for HR, with latest comments) + HAKOM links for HR (CAPTCHA-gated, manual) + search-format variants. `--accounts` adds silent Microsoft/Amazon/Zoho existence checks via phonsint |
-| `intel <domain.com>` | RDAP whois (with system-`whois` ccTLD fallback) + crt.sh subdomains + oldest Wayback snapshot |
+| `intel <domain.com>` | RDAP whois (with system-`whois` ccTLD fallback) + crt.sh + subfinder subdomains (per-source status) + oldest Wayback snapshot. IDN domains are punycoded |
+| `intel <github-url>` | GitHub exposure audit: profile, linked socials, orgs, GPG-key emails, SSH key count, and the author identities in its own commits (real address vs noreply) + maigret on the handle |
+| `intel <discord-id>` | snowflake decode: account/message creation time (Discord and X epochs), offline |
+| `intel <url>` | the page's preview card + its domain. Profile URLs (x.com, instagram, tiktok, reddit, t.me...) resolve to the handle; `tel:`/`mailto:` unwrap |
 | `intel "Acme Ltd"` | GLEIF legal entity + LEI + recent news |
 | `intel "Name + clues"` | news pivot + the akinator-style resolver loop |
 
@@ -47,6 +50,8 @@ intel handles "First Last"            # username permutations, GitHub-existence 
 intel phone "+43 664 123 4567"        # phone: line identity + allocation + spam reports
 intel phone "0664 1234567" --region=AT # national format needs a country (assumed + flagged)
 intel archive <url>                   # Wayback first-seen + latest + live-vs-archive diff (tamper)
+intel capture <url>                   # evidence: raw page + sha256 + UTC time + Wayback copy, logged
+intel sun 45.81,15.98 2026-06-21 334  # shadow bearing -> UTC time bands that day (chronolocation)
 intel media <url>                     # the headshot/preview image a page advertises
 intel embed <image-url>               # image -> self-contained data: URI (for the brief)
 ```
@@ -95,6 +100,7 @@ Core is Python 3.9+ **stdlib only**. The finder modules shell out to a few well-
 
 ```bash
 pipx install maigret holehe          # username + email finders
+# optional: passive subdomains (projectdiscovery/subfinder release binary), exiftool, whois
 # optional, for phone: offline carrier/line-type metadata (Google's libphonenumber)
 python3 -m venv ~/.local/share/intel/venv && ~/.local/share/intel/venv/bin/pip install phonenumbers
 # optional, for `intel phone --accounts` (pinned to the source-reviewed commit)
