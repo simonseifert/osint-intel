@@ -532,6 +532,8 @@ not as a failure, and point at the lever that does work: report it to RTR
 
 ## Tools inventory
 
+**Health:** `python3 tests/canary.py` (in the intel repo) runs live known-answer checks against every source; a weekly timer runs it and alerts on failure. Offline logic tests: `python3 -m unittest discover -s tests`. When a source misbehaves mid-investigation, run the canary before trusting any "not found".
+
 **Check before you plan, never trust this list blindly** (tools rot, machines differ):
 `for t in maigret holehe sherlock gallery-dl ddgs exiftool whois theHarvester subfinder
 yt-dlp; do printf '%-12s %s\n' $t "$(command -v $t || echo MISSING)"; done`

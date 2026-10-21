@@ -640,13 +640,16 @@ def mod_news(query):
     query = _CO_SUFFIX.sub("", query).strip(" ,.") or query
     arts, status = _gdelt(query)
     source = "gdelt"
-    if status != "ok" or not arts:
-        # GDELT 429s bursts from one IP. Fall back to Google News RSS rather than
-        # report a famous company as having no press.
-        arts = [{"country": None, "domain": a.get("source"), "title": a.get("title"),
-                 "url": a.get("url"), "date": a.get("date"), "image": None}
-                for a in google_news(query, "us", limit=20)]
-        source = "google-news-rss (gdelt " + ("failed" if status != "ok" else "empty") + ")"
+    if status != "ok" or len(arts) < 3:
+        # GDELT 429s bursts from one IP and is thin on some names. Top up from Google
+        # News RSS rather than report a famous company as having no press.
+        seen = {x.get("url") for x in arts}
+        rss = [{"country": None, "domain": a.get("source"), "title": a.get("title"),
+                "url": a.get("url"), "date": a.get("date"), "image": None}
+               for a in google_news(query, "us", limit=20) if a.get("url") not in seen]
+        source = ("gdelt + google-news-rss" if arts else
+                  "google-news-rss (gdelt " + ("failed" if status != "ok" else "empty") + ")")
+        arts = arts + rss
         status = "ok" if arts or status == "ok" else "failed"
     return {"module": "news", "seed": query, "source": source, "status": status,
             "articles": arts, "corroboration": corroboration(arts)}

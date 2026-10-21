@@ -129,3 +129,15 @@ token in `~/.config/intel/apify_token` (chmod 600). Everything else is free and 
 ## 📜 License
 
 [MIT](LICENSE) © Simon Seifert
+
+## Tests
+
+```bash
+python3 -m unittest discover -s tests -v   # offline: detection, OIB, sanitizer, sun, every phone parser (synthetic pages)
+python3 tests/canary.py                    # live known-answer checks against the real sources (needs network)
+```
+
+The offline suite pins the parsing logic (mutation-checked: removing the spamcalls redirect guard or the
+telefonbroj template-card filter fails it). The canary catches the other failure mode, a site redesign or an
+exhausted API key, which otherwise shows up as a silent "not found". Run it on a timer; with `--notify` it
+messages you only when something broke (settings in `~/.config/intel/canary.json`, outside the repo).
