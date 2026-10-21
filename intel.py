@@ -603,19 +603,27 @@ def run_actor(actor, run_input, timeout=300):
     if not tok:
         return {"error": "no Apify token (~/.config/intel/apify_token or $INTEL_APIFY_TOKEN)"}
     aid = actor.replace("/", "~")
-    url = f"https://api.apify.com/v2/acts/{aid}/run-sync-get-dataset-items?token={tok}&timeout={timeout}"
+    # Token goes in the Authorization header, never the query string: URLs land in
+    # server logs, proxy history and error reports, and a leaked Apify token is
+    # billable. Same reason reach moved off ?token= in cafd656.
+    url = f"https://api.apify.com/v2/acts/{aid}/run-sync-get-dataset-items?timeout={timeout}"
     req = urllib.request.Request(url, data=json.dumps(run_input).encode(),
-                                 headers={**UA, "Content-Type": "application/json"})
+                                 headers={**UA, "Content-Type": "application/json",
+                                          "Authorization": f"Bearer {tok}"})
     with urllib.request.urlopen(req, timeout=timeout + 15) as r:
         return json.loads(r.read())
 
 
 def linkedin(url):
+    # Input keys come from the actor's own schema
+    # (GET /v2/acts/<actor>/builds/default/openapi.json), not from guessing:
+    # a wrong key makes the run SUCCEED with an empty dataset rather than error,
+    # which is how "profileUrls" silently returned nothing here until 2026-08-05.
     if "/company/" in url:
         return {"module": "linkedin-company",
                 "data": run_actor("harvestapi/linkedin-company", {"companies": [url]})}
     return {"module": "linkedin-profile",
-            "data": run_actor("harvestapi/linkedin-profile-scraper", {"profileUrls": [url]})}
+            "data": run_actor("harvestapi/linkedin-profile-scraper", {"urls": [url]})}
 
 
 def linkedin_search(query, limit=10):
