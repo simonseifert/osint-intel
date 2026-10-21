@@ -113,7 +113,15 @@ ln -s "$PWD/osint-intel/intel.py" ~/.local/bin/intel   # put it on PATH
 ```
 
 **Optional paid tier** (cookieless LinkedIn via Apify): set `INTEL_APIFY_TOKEN`, or drop the
-token in `~/.config/intel/apify_token` (chmod 600). Everything else is free and keyless.
+token in `~/.config/intel/apify_token` (chmod 600). Every run carries an Apify-enforced spend
+cap. Everything else is free and keyless.
+
+**Optional content mode**: if you also run a `corpus`-style back-catalogue tool (a CLI that
+stores an account's posts and answers `corpus profile <url> --json`), point
+`INTEL_CORPUS_CMD` (or `~/.config/intel/corpus_cmd`) at it, e.g.
+`ssh mac /path/to/corpus/.venv/bin/corpus`. Then `intel content ...` passes through to it, and
+`intel linkedin <url>` returns a stored full profile for $0 before paying for a fresh one
+(`--fresh` skips that).
 
 ## ⚖️ Ethics & legal
 

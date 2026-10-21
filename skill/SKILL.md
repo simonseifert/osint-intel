@@ -1,6 +1,6 @@
 ---
 name: intel
-description: Unified OSINT and intelligence. Auto-detects the target (email, username/handle, phone number, domain, company, or a person described by clues) and runs the right modules, then fetches, ANALYZES (text, images, video), and assembles a visual BRIEF (with optional PDF export). Use for "osint X", "check my/this footprint" / "how exposed am I" (self-audit mode), "who is this GitHub/Discord account", "who is this username/email", "who is behind this phone number / who called me / is this number spam", "look up this company/domain", "find the person who <clues>" (akinator), "analyze this brand's socials", "is this email breached", "dig into <company>", "build a brief/dossier on X". Covers people, businesses, brands, domains, breaches, LinkedIn, local news, photos and video. Self / authorized / brand / consenting subjects only.
+description: Unified OSINT and intelligence. Auto-detects the target (email, username/handle, phone number, domain, company, or a person described by clues) and runs the right modules, then fetches, ANALYZES (text, images, video), and assembles a visual BRIEF (with optional PDF export). Use for "osint X", "check my/this footprint" / "how exposed am I" (self-audit mode), "who is this GitHub/Discord account", "who is this username/email", "who is behind this phone number / who called me / is this number spam", "look up this company/domain", "find the person who <clues>" (akinator), "analyze this brand's socials", "is this email breached", "dig into <company>", "build a brief/dossier on X". Also the front door to `corpus` (content mode): "download/pull someone's LinkedIn or Instagram posts", "content audit of X", "what is working for <competitor/creator>", "brief on my/client's content", "track this profile". Covers people, businesses, brands, domains, breaches, LinkedIn (profiles AND post back-catalogues), local news, photos and video. Self / authorized / brand / consenting subjects only.
 ---
 
 # intel
@@ -92,10 +92,58 @@ Keyless pivots (each is a separate subcommand, JSON out):
   returns the UTC time bands that day. Offline (NOAA formula, ~0.5 deg).
 
 Explicit LinkedIn (paid Apify, cookieless, your login never used, ~$0.004/lookup):
-- `intel linkedin <profile-or-company-url>` - full profile or company page.
+- `intel linkedin <profile-or-company-url>` - full profile or company page. **Checks corpus
+  first**: if corpus holds a full profile synced in the last 90 days it returns that for $0
+  (`# source: corpus (stored, $0), as of <date>`). A posts-only author stub or an older
+  copy falls through to Apify, and the header says why (`corpus: stub only|stale|
+  not_tracked|unavailable`). `--fresh` forces a paid re-fetch. Quote the `as of` date.
 - `intel linkedin-search "title location keywords"` - people search ($0.10/page, deliberate).
-`--deep` also auto-enriches any LinkedIn URL a username scan surfaces.
-Tool: `intel.py`. Apify token: `~/.config/intel/apify_token`.
+`--deep` also auto-enriches any LinkedIn URL a username scan surfaces (same corpus-first rule).
+Every actor run carries an Apify-enforced spend cap (`maxTotalChargeUsd`: $0.05 profile,
+$0.50 search). An Apify error prints as `{"error": "apify 402/403 ..."}`, never as "no
+results". 403 "Too many outstanding invoices" = billing, not the actor.
+Tool: `intel.py`. Apify token: `~/.config/intel/apify_token`, else
+`APIFY_TOKEN` in `~/.reach/keys.env` (the one corpus and reach use).
+
+## CONTENT mode: `intel content ...` -> corpus (post back-catalogues + audits)
+
+`intel` answers WHO someone is. `corpus` (a separate tool, not in this repo) downloads
+WHAT an account has published: every LinkedIn/Instagram post with metrics, media,
+transcripts and comments, into SQLite, then runs audit lenses and renders a client brief.
+It keeps its data in `~/.corpus/` on the machine it runs on. `intel content <args>` passes
+straight through to it, locally or over ssh (`$INTEL_CORPUS_CMD` or
+`~/.config/intel/corpus_cmd`, e.g. `ssh mac /path/to/corpus/.venv/bin/corpus`). Same Apify token, same actors as
+`intel linkedin`, so a stored profile and a fresh one are the same JSON.
+
+```
+intel content find "Name" --location Rijeka --company X  # candidates to CONFIRM, never an answer
+intel content add <url> --relationship own|client|competitor|influencer [--client-ref acme]
+intel content sync --dry-run      # prices it, spends nothing; then: intel content sync <handle>
+intel content enrich              # transcripts + keyframes
+intel content comments --dry-run  # comment text is priced per comment
+intel content analyze content-audit --execute   # dry-run without --execute
+intel content brief <handle>      # one HTML file in ~/Downloads (where corpus runs)
+intel content search "cold outreach" | profile <handle> --json | health | adapters
+intel content dashboard           # 127.0.0.1:8891 where corpus runs; tunnel it over ssh -L
+```
+
+Routing between the two:
+- "Who is this LinkedIn person?" -> `intel linkedin <url>` (one profile, corpus-first).
+- "What do they post / what works for them / audit their content" -> content mode.
+- Unknown URL -> `intel` verification FIRST (namesake gate, identity anchors), then
+  `intel content add` the confirmed URL. corpus `find` ranks candidates; it does not verify.
+- A brief that needs both: run content mode for the posts, `intel` for the person/company
+  context (sudreg, news, domain), and cite each with its source and as-of date.
+
+**Proportionality for content mode is stricter than for a lookup**, because it archives a
+person's whole output plus comments written by third parties. `--relationship` is the gate:
+`own`/`client` (consented; their own LinkedIn Analytics export is better than any scrape),
+`competitor`/`influencer` = businesses and people who publish professionally to an audience.
+A private individual (a job applicant, a date, a neighbour) is NEVER added to corpus: a
+single `intel linkedin` profile read is the ceiling there. `intel content forget <handle>`
+erases an account entirely (GDPR) - offer it when a subject is no longer needed.
+Honest limits to repeat in any brief: reach/impressions/saves are owner-only; IG stories
+cannot be backfilled; comments are capped at 25/post, one level.
 
 ## Investigation loop (find -> verify -> pivot -> fetch -> analyze)
 
@@ -336,6 +384,8 @@ dossier. Offer the PDF; do not always generate it.
   Live quotes -> Finnhub (free key, 60/min). UK private -> Companies House. Otherwise private
   funding is mostly paywalled (be honest).
 - **People at the company:** `intel linkedin-search`, `intel linkedin <company-url>`.
+- **What the brand publishes:** content mode (`intel content add <company-or-ig-url>
+  --relationship competitor`, then `sync`/`analyze`/`brief`) instead of hand-scrolling.
 - **History + reputation:** Wayback CDX, HN Algolia (`hn.algolia.com/api`), reviews via
   `firecrawl`. **Investigative/leaks:** OCCRP Aleph (Balkan-strong; metadata keyless),
   DocumentCloud (`api.www.documentcloud.org/.../search`), ICIJ Offshore Leaks (manual pivot).
@@ -547,7 +597,7 @@ castrickclues (domain gone).
 Fetchers: `reach` (Exa/Jina/Firecrawl/search/IG/Reddit/YouTube; Jina, Firecrawl and the
 Apify-backed Reddit route can run out of credits, so check `reach doctor` when results
 look empty), `agent-reach` (cookie social), `browser-use`, `browse` (headless Chrome, has
-`pdf`). PDF: `make-pdf`/`pdf` skills. Paid-per-run: Apify actors via `intel linkedin*`.
+`pdf`). PDF: `make-pdf`/`pdf` skills. Paid-per-run: Apify actors via `intel linkedin*` and content mode (corpus).
 
 **Manual-only services (use in the browser, never wire):** Epieos free tier (30/mo),
 Predicta Search free tier (check that any image search is not face matching first),

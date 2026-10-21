@@ -26,11 +26,17 @@ Pivots (keyless):
     intel <github-url | discord-id>       GitHub exposure audit / snowflake account date
 
 Deep (paid, Apify) LinkedIn on demand:
-    intel linkedin <profile-or-company-url>     harvestapi (cookieless, ~$0.004)
+    intel linkedin <profile-or-company-url>     harvestapi (cookieless, ~$0.004);
+                   [--fresh]                    $0 when corpus already holds it
     intel linkedin-search "title location ..."  people search ($0.10/page)
 
+Content back-catalogue (passes through to the separate `corpus` tool):
+    intel content add <url> --relationship own|client|competitor|influencer
+    intel content sync|comments|analyze|brief|find|search|profile|health ...
+
 Flags: --json  --deep (paid Apify enrichment of found LinkedIn URLs)  --region=XX (phone).
-Keyless by default; Apify token read from ~/.config/intel/apify_token or $INTEL_APIFY_TOKEN.
+Keyless by default; Apify token from ~/.config/intel/apify_token, $INTEL_APIFY_TOKEN or
+APIFY_TOKEN in ~/.reach/keys.env. corpus via $INTEL_CORPUS_CMD / ~/.config/intel/corpus_cmd.
 Self / authorized / brand / consenting subjects only.
 """
 import base64
@@ -1449,41 +1455,132 @@ def _apify_token():
     if os.path.exists(p):
         with open(p) as fh:
             return fh.read().strip()
-    return None
+    # The same token corpus and reach use, so one key funds every LinkedIn route.
+    return _keys_env("APIFY_TOKEN")
 
 
-def run_actor(actor, run_input, timeout=300):
+def run_actor(actor, run_input, timeout=300, max_charge=0.25):
     tok = _apify_token()
     if not tok:
-        return {"error": "no Apify token (~/.config/intel/apify_token or $INTEL_APIFY_TOKEN)"}
+        return {"error": "no Apify token (~/.config/intel/apify_token, $INTEL_APIFY_TOKEN "
+                         "or APIFY_TOKEN in ~/.reach/keys.env)"}
     aid = actor.replace("/", "~")
     # Token goes in the Authorization header, never the query string: URLs land in
     # server logs, proxy history and error reports, and a leaked Apify token is
     # billable. Same reason reach moved off ?token= in cafd656.
-    url = f"https://api.apify.com/v2/acts/{aid}/run-sync-get-dataset-items?timeout={timeout}"
+    # maxTotalChargeUsd is enforced by Apify itself, so a wrong input or a runaway
+    # pay-per-result actor stops at the cap instead of at the monthly limit.
+    url = (f"https://api.apify.com/v2/acts/{aid}/run-sync-get-dataset-items"
+           f"?timeout={timeout}&maxTotalChargeUsd={max_charge}")
     req = urllib.request.Request(url, data=json.dumps(run_input).encode(),
                                  headers={**UA, "Content-Type": "application/json",
                                           "Authorization": f"Bearer {tok}"})
-    with urllib.request.urlopen(req, timeout=timeout + 15) as r:
-        return json.loads(r.read())
+    try:
+        with urllib.request.urlopen(req, timeout=timeout + 15) as r:
+            return json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        # 402 = out of credit/cap, 403 = token or plan: say which, never "no results".
+        return {"error": f"apify {e.code} on {actor}: {e.read()[:200].decode(errors='replace')}"}
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        return {"error": f"apify unreachable for {actor}: {e}"}
 
 
-def linkedin(url):
+# ---------------- corpus (the content back-catalogue) ----------------
+#
+# corpus is a separate private tool: it downloads an account's whole LinkedIn/IG
+# back-catalogue into SQLite and audits it. intel is the front door to it:
+#   `intel content <corpus args>`  runs corpus (locally, or over ssh where it lives)
+#   `intel linkedin <url>`         reads the profile corpus already paid for, first.
+# The command comes from $INTEL_CORPUS_CMD or ~/.config/intel/corpus_cmd, e.g.
+# "ssh mac /Users/me/corpus/.venv/bin/corpus", else `corpus` on PATH.
+
+CORPUS_MAX_AGE_DAYS = 90
+
+
+def _corpus_cmd():
+    import shlex
+    c = os.environ.get("INTEL_CORPUS_CMD")
+    p = os.path.expanduser("~/.config/intel/corpus_cmd")
+    if not c and os.path.exists(p):
+        with open(p) as fh:
+            c = fh.read().strip()
+    if c:
+        return shlex.split(c)
+    w = shutil.which("corpus")
+    return [w] if w else None
+
+
+def _corpus_argv(args):
+    """ssh hands its trailing words to a remote SHELL, so each argument is quoted
+    there; locally they go straight to exec and must not be."""
+    import shlex
+    cmd = _corpus_cmd()
+    if not cmd:
+        return None
+    if os.path.basename(cmd[0]) == "ssh":
+        return cmd + [shlex.quote(x) for x in args]
+    return cmd + list(args)
+
+
+def corpus_profile(target):
+    """found / not_tracked / unavailable. Never raises: a missing corpus only means
+    intel pays for the lookup, it must not stop the lookup."""
+    argv = _corpus_argv(["profile", target, "--json"])
+    if not argv:
+        return {"status": "unavailable", "why": "corpus not configured"}
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=45)
+        d = json.loads(r.stdout.strip().splitlines()[-1])
+    except (OSError, subprocess.TimeoutExpired, ValueError, IndexError) as e:
+        return {"status": "unavailable", "why": f"{type(e).__name__}"}
+    return d if isinstance(d, dict) and d.get("status") else {"status": "unavailable"}
+
+
+def corpus_passthrough(args):
+    argv = _corpus_argv(args)
+    if not argv:
+        print("corpus is not configured: set $INTEL_CORPUS_CMD or ~/.config/intel/"
+              "corpus_cmd, or put `corpus` on PATH", file=sys.stderr)
+        return 2
+    if argv[0].endswith("ssh") and "-t" not in argv and sys.stdin.isatty():
+        argv.insert(1, "-t")      # corpus colours and prompts want a terminal
+    return subprocess.call(argv)
+
+
+def linkedin(url, fresh=False, max_age_days=CORPUS_MAX_AGE_DAYS):
     # Input keys come from the actor's own schema
     # (GET /v2/acts/<actor>/builds/default/openapi.json), not from guessing:
     # a wrong key makes the run SUCCEED with an empty dataset rather than error,
     # which is how "profileUrls" silently returned nothing here until 2026-08-05.
-    if "/company/" in url:
-        return {"module": "linkedin-company",
-                "data": run_actor("harvestapi/linkedin-company", {"companies": [url]})}
-    return {"module": "linkedin-profile",
-            "data": run_actor("harvestapi/linkedin-profile-scraper", {"urls": [url]})}
+    module = "linkedin-company" if "/company/" in url else "linkedin-profile"
+    # corpus runs the SAME harvestapi actors and keeps the raw payload, so a stored
+    # profile is byte-compatible with a fresh one. Only a full profile counts (the
+    # posts actor leaves a name/headline stub), and only within max_age_days.
+    cached = {"status": "skipped (--fresh)"} if fresh else corpus_profile(url)
+    if cached.get("status") == "found":
+        age = (time.time() - (cached.get("last_scraped_at") or 0)) / 86400
+        if cached.get("complete") and age <= max_age_days:
+            return {"module": module, "source": "corpus (stored, $0)",
+                    "as_of": time.strftime("%Y-%m-%d", time.gmtime(cached["last_scraped_at"])),
+                    "relationship": cached.get("relationship"),
+                    "data": [cached["profile"]]}
+        cached = {"status": "stale" if cached.get("complete") else "stub only",
+                  "age_days": round(age)}
+    if module == "linkedin-company":
+        data = run_actor("harvestapi/linkedin-company", {"companies": [url]}, max_charge=0.05)
+    else:
+        data = run_actor("harvestapi/linkedin-profile-scraper", {"urls": [url]},
+                         max_charge=0.05)
+    return {"module": module, "source": "apify (paid, ~$0.004)",
+            "as_of": time.strftime("%Y-%m-%d", time.gmtime()),
+            "corpus": cached.get("status"), "data": data}
 
 
 def linkedin_search(query, limit=10):
     return {"module": "linkedin-search",
             "data": run_actor("harvestapi/linkedin-profile-search",
-                              {"searchQuery": query, "maxItems": limit})}
+                              {"searchQuery": query, "maxItems": limit},
+                              max_charge=0.5)}
 
 
 # ---------------- evidence capture ----------------
@@ -1994,11 +2091,14 @@ def main(argv=None):
     if not a:
         print(__doc__)
         return
+    if argv and argv[0] == "content":
+        # Raw argv: corpus owns its own flags (--dry-run, --relationship, ...).
+        sys.exit(corpus_passthrough(argv[1:]))
     if a[0] == "embed" and len(a) > 1:
         print(embed(a[1]))
         return
     if a[0] == "linkedin" and len(a) > 1:
-        out = linkedin(a[1])
+        out = linkedin(a[1], fresh="--fresh" in argv)
     elif a[0] == "linkedin-search" and len(a) > 1:
         out = linkedin_search(" ".join(a[1:]))
     elif a[0] == "news" and len(a) > 1:
@@ -2033,6 +2133,9 @@ def main(argv=None):
         # json escapes C0 controls itself, but not C1 or bidi overrides
         print(_clean(json.dumps(out, indent=2, ensure_ascii=False)))
     elif "module" in out:
+        if out.get("source"):
+            print(f"# source: {out['source']}, as of {out.get('as_of')}"
+                  + (f", corpus: {out['corpus']}" if out.get("corpus") else ""))
         print(_clean(json.dumps(out.get("data", out), indent=2, ensure_ascii=False)[:4000]))
     else:
         buf = io.StringIO()

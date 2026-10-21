@@ -299,5 +299,78 @@ class Output(unittest.TestCase):
         self.assertIn("retrieved_at", d)
 
 
+class CorpusBridge(unittest.TestCase):
+    """intel reads what corpus already paid for, and only falls back to Apify when
+    corpus cannot answer. Every branch here would otherwise cost money to test."""
+
+    def setUp(self):
+        self._prof, self._actor = intel.corpus_profile, intel.run_actor
+        self.actor_calls = []
+        intel.run_actor = lambda *a, **k: self.actor_calls.append(a) or [{"paid": True}]
+
+    def tearDown(self):
+        intel.corpus_profile, intel.run_actor = self._prof, self._actor
+
+    def stored(self, **over):
+        d = {"status": "found", "complete": True, "relationship": "own",
+             "last_scraped_at": intel.time.time() - 86400, "profile": {"firstName": "A"}}
+        d.update(over)
+        intel.corpus_profile = lambda target: d
+
+    def test_fresh_full_profile_is_free(self):
+        self.stored()
+        out = intel.linkedin("https://www.linkedin.com/in/someone/")
+        self.assertEqual(out["data"], [{"firstName": "A"}])
+        self.assertTrue(out["source"].startswith("corpus"))
+        self.assertEqual(self.actor_calls, [])
+
+    def test_author_stub_is_not_a_profile(self):
+        self.stored(complete=False)
+        out = intel.linkedin("https://www.linkedin.com/in/someone/")
+        self.assertEqual(out["corpus"], "stub only")
+        self.assertEqual(len(self.actor_calls), 1)
+
+    def test_stale_profile_is_refetched(self):
+        self.stored(last_scraped_at=intel.time.time() - 200 * 86400)
+        self.assertEqual(intel.linkedin("https://www.linkedin.com/in/x/")["corpus"], "stale")
+        self.assertEqual(len(self.actor_calls), 1)
+
+    def test_fresh_flag_skips_corpus(self):
+        self.stored()
+        out = intel.linkedin("https://www.linkedin.com/in/x/", fresh=True)
+        self.assertEqual(out["data"], [{"paid": True}])
+
+    def test_company_url_uses_the_company_actor(self):
+        intel.corpus_profile = lambda t: {"status": "not_tracked"}
+        intel.linkedin("https://www.linkedin.com/company/acme/")
+        self.assertEqual(self.actor_calls[0][0], "harvestapi/linkedin-company")
+
+    def test_ssh_arguments_are_quoted_for_the_remote_shell(self):
+        orig = os.environ.get("INTEL_CORPUS_CMD")
+        try:
+            os.environ["INTEL_CORPUS_CMD"] = "ssh box /bin/corpus"
+            argv = intel._corpus_argv(["find", "Ana Horvat; rm -rf ~"])
+            self.assertEqual(argv[-1], "'Ana Horvat; rm -rf ~'")
+            os.environ["INTEL_CORPUS_CMD"] = "/bin/corpus"
+            self.assertEqual(intel._corpus_argv(["find", "Ana Horvat"])[-1], "Ana Horvat")
+        finally:
+            if orig is None:
+                os.environ.pop("INTEL_CORPUS_CMD", None)
+            else:
+                os.environ["INTEL_CORPUS_CMD"] = orig
+
+    def test_broken_corpus_is_unavailable_not_a_crash(self):
+        orig = os.environ.get("INTEL_CORPUS_CMD")
+        try:
+            os.environ["INTEL_CORPUS_CMD"] = "/nonexistent/corpus"
+            self.assertEqual(self._prof("https://www.linkedin.com/in/x/")["status"],
+                             "unavailable")
+        finally:
+            if orig is None:
+                os.environ.pop("INTEL_CORPUS_CMD", None)
+            else:
+                os.environ["INTEL_CORPUS_CMD"] = orig
+
+
 if __name__ == "__main__":
     unittest.main()

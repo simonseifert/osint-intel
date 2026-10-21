@@ -103,6 +103,14 @@ def checks():
     yield check("Hudson Rock: keyless endpoint answers",
                 lambda: intel._hudsonrock("email", "test@example.com"),
                 lambda r: r is not None and r.get("user_services") is not None)
+    # A real paid run (~$0.004/week). The doctor line below only reads the monthly
+    # cap, and passed on 2026-10-22 while every actor run was refused with 403
+    # "Too many outstanding invoices". This also catches the actor's input schema
+    # drifting, which shows up as an empty dataset rather than an error.
+    yield check("Apify: LinkedIn profile actor actually runs",
+                lambda: intel.linkedin("https://www.linkedin.com/in/williamhgates/",
+                                       fresh=True)["data"],
+                lambda d: isinstance(d, list) and d and d[0].get("lastName") == "Gates")
     yield check("reach doctor: no paid backend out of credit",
                 lambda: [re.sub(r"\x1b\[[0-9;]*m", "", ln).strip() for ln in subprocess.run(
                     ["reach", "doctor"], capture_output=True, text=True, timeout=120
