@@ -1144,7 +1144,8 @@ def embed(url):
 # ---------------- permutation + verify (the 'approximations' idea) ----------------
 
 def permute_emails(first, last, domain):
-    f, l = re.sub(r"[^a-z]", "", first.lower()), re.sub(r"[^a-z]", "", last.lower())
+    f = re.sub(r"[^a-z]", "", _ascii_fold(first).lower())
+    l = re.sub(r"[^a-z]", "", _ascii_fold(last).lower())
     fi, li = (f[:1] or "x"), (l[:1] or "x")
     pats = [f"{f}.{l}", f"{f}{l}", f"{fi}{l}", f"{f}{li}", f"{fi}.{l}", f"{l}.{f}",
             f"{l}{f}", f"{f}", f"{f}_{l}", f"{f}-{l}", f"{l}{fi}", f"{fi}{li}", f"{l}.{fi}"]
@@ -1171,8 +1172,18 @@ def mod_emailguess(name, domain):
             "hint": "Confirm a candidate with `intel <email>` (holehe + breach + Gravatar)."}
 
 
+def _ascii_fold(s):
+    """Tomić -> tomic, Đurđević -> djurdjevic, Müller -> muller. Handles and email
+    local-parts are ASCII; deleting the accented letter instead ("tomi") makes every
+    candidate wrong for most Croatian, Serbian and German surnames."""
+    import unicodedata
+    s = s.replace("đ", "dj").replace("Đ", "Dj").replace("ß", "ss").replace("ł", "l")
+    return "".join(c for c in unicodedata.normalize("NFKD", s)
+                   if not unicodedata.combining(c))
+
+
 def permute_usernames(name):
-    parts = re.sub(r"[^a-z ]", "", name.lower()).split()
+    parts = re.sub(r"[^a-z ]", "", _ascii_fold(name).lower()).split()
     if len(parts) < 2:
         b = parts[0] if parts else re.sub(r"[^a-z0-9]", "", name.lower())
         return list(dict.fromkeys([b, f"{b}1", f"{b}_", f"the{b}"]))
