@@ -258,8 +258,12 @@ def mod_email(q):
         pass
     try:
         d = _json(f"https://leakcheck.io/api/public?check={urllib.parse.quote(q)}", timeout=12)
+        if not d.get("success") and str(d.get("error", "")).lower() == "not found":
+            out["breaches"] = {"status": "clean", "count": 0, "sources": [], "fields": []}
+        elif not d.get("success"):
+            out["breaches"] = {"status": "unknown", "error": str(d.get("error"))[:120]}
         if d.get("success"):
-            out["breaches"] = {"count": d.get("found"),
+            out["breaches"] = {"status": "found", "count": d.get("found"),
                                "sources": [{"name": s.get("name"), "date": s.get("date")}
                                            for s in d.get("sources", [])[:25]],
                                "fields": d.get("fields", [])}
@@ -660,7 +664,11 @@ def google_news(query, locale="us", limit=15):
     """Google News RSS for one locale — surfaces native local-language press GDELT under-indexes.
     e.g. locale='hr' pulls Croatian outlets by name. Keyless."""
     hl, gl, ceid = _LOCALES.get(locale, _LOCALES["us"])
-    url = (f"https://news.google.com/rss/search?q={urllib.parse.quote(query)}"
+    # A multi-word name must be an exact phrase: unquoted, "Simon Seifert" returns
+    # every Seifert obituary and every Simon in sport. Then the namesake gate: drop
+    # items whose title lacks any word of the query.
+    phrase = f'"{query}"' if " " in query.strip() and '"' not in query else query
+    url = (f"https://news.google.com/rss/search?q={urllib.parse.quote(phrase)}"
            f"&hl={hl}&gl={gl}&ceid={ceid}")
     try:
         root = ET.fromstring(_get(url, timeout=12))
@@ -669,7 +677,11 @@ def google_news(query, locale="us", limit=15):
     out = []
     for item in root.iter("item"):
         src = item.find("source")
-        out.append({"title": (item.findtext("title") or "").strip(), "url": item.findtext("link"),
+        title = (item.findtext("title") or "").strip()
+        words = re.findall(r"\w{3,}", _ascii_fold(query).lower())
+        if words and not all(w in _ascii_fold(title).lower() for w in words):
+            continue
+        out.append({"title": title, "url": item.findtext("link"),
                     "date": item.findtext("pubDate"), "locale": locale,
                     "source": src.text if src is not None else None})
         if len(out) >= limit:
@@ -1810,7 +1822,11 @@ def _print(res):
                 for a in g.get("accounts", []):
                     print(f"    {a['service']:14} {a['url']}")
             b = m.get("breaches")
-            if b:
+            if not b or b.get("status") == "unknown":
+                print("  breaches: lookup FAILED (no information either way)")
+            elif b.get("status") == "clean":
+                print("  breaches: none in LeakCheck's public index (not proof of none anywhere)")
+            if b and b.get("status") == "found":
                 print(f"  breaches: {b['count']} · fields: {', '.join(b.get('fields', [])[:6])}")
                 for s in b["sources"][:10]:
                     print(f"    {s['name']:28} {s.get('date') or ''}")
