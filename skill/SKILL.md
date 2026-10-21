@@ -351,8 +351,13 @@ dossier. Offer the PDF; do not always generate it.
   - `companywall.hr/tvrtka/...`, `fininfo.hr/Poduzece/...` - single company pages (OIB,
     status) return 200; fetch one page on demand, never crawl (robots blocks search and
     owner graphs). `poslovna.hr` is login/trial only.
-  - `sudreg-data.gov.hr` is NOT keyless: free registration -> OAuth2 client id/secret.
-    Best HR anchor (OIB/MBS, officers, status) once you register.
+  - **sudreg (court register): WIRED.** `intel "Firma d.o.o."` or a bare OIB
+    (`intel 81793146560`, checksum-validated) returns name, short name, OIB/MBS, legal
+    form, active/bankruptcy/liquidation flags, founding date, seat address, court, NKD,
+    share capital, company email, years of filed financial statements, last change.
+    Name search is exact first, then `%partial%`. The open API has **no people**
+    (directors/members are not in it), and obrti are a separate register. Needs
+    `SUDREG_CLIENT_ID`/`SUDREG_CLIENT_SECRET` (env or `~/.reach/keys.env`; free registration at sudreg-data.gov.hr).
   - `data.gov.hr` CKAN API (`/ckan/api/3/action/package_search?q=`) - association and
     other public registers.
   - Out of scope: the land registry (`oss.uredjenazemlja.hr`) is public but is a

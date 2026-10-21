@@ -137,6 +137,8 @@ def classify(q):
     digits = re.sub(r"\D", "", q)
     if re.fullmatch(r"\d{17,20}", q):
         return "snowflake", q
+    if valid_oib(q) and not q.startswith(("0", "385")):  # 385... = a phone missing its +
+        return "company", q  # Croatian OIB (checksum-valid); sudreg resolves it
     if PHONE_RE.match(q) and 7 <= len(digits) <= 15:
         return "phone", q  # E.164 allows 15 digits; <7 is a username, not a number
     url = q if low.startswith(("http://", "https://")) else None
@@ -404,18 +406,155 @@ def mod_domain(q):
     return out
 
 
+# ---------------- Croatian court register (sudreg open data) ----------------
+
+_SUDREG = "https://sudreg-data.gov.hr/api/javni/"
+
+
+def _keys_env(name):
+    """Env var, else ~/.reach/keys.env (where Simon keeps API credentials, chmod 600)."""
+    if os.environ.get(name):
+        return os.environ[name]
+    try:
+        with open(os.path.expanduser("~/.reach/keys.env")) as fh:
+            for line in fh:
+                k, _, v = line.strip().partition("=")
+                if k == name:
+                    return v.strip().strip("'\"")
+    except OSError:
+        pass
+    return None
+
+
+def _sudreg_token():
+    cid, sec = _keys_env("SUDREG_CLIENT_ID"), _keys_env("SUDREG_CLIENT_SECRET")
+    if not (cid and sec):
+        return None
+    auth = base64.b64encode(f"{cid}:{sec}".encode()).decode()
+    req = urllib.request.Request("https://sudreg-data.gov.hr/api/oauth/token",
+                                 data=b"grant_type=client_credentials",
+                                 headers={**UA, "Authorization": "Basic " + auth,
+                                          "Content-Type": "application/x-www-form-urlencoded"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read()).get("access_token")
+
+
+def _sudreg_get(tok, path, **params):
+    try:
+        d = _json(_SUDREG + path + "?" + urllib.parse.urlencode(params),
+                  headers={"Authorization": f"Bearer {tok}"}, timeout=20)
+    except urllib.error.HTTPError as e:
+        # "no rows" arrives as HTTP 400 with {"error_code": 505}; anything else is real
+        try:
+            d = json.loads(e.read())
+        except ValueError:
+            raise e from None
+        if not (isinstance(d, dict) and d.get("error_code") == 505):
+            raise
+        return []
+    # "no rows" comes back as an error object (code 505), not an empty list
+    return [] if isinstance(d, dict) and d.get("error_code") == 505 else d
+
+
+def valid_oib(s):
+    """Croatian OIB: 11 digits, ISO 7064 MOD 11,10 check digit."""
+    if not re.fullmatch(r"\d{11}", s or ""):
+        return False
+    a = 10
+    for c in s[:10]:
+        a = (a + int(c)) % 10 or 10
+        a = (a * 2) % 11
+    return (11 - a) % 10 == int(s[10])
+
+
+def sudreg(q, limit=5):
+    """Croatian companies from the court register: name (exact, then %partial%) or OIB.
+    Companies only: obrti are a separate register. The open API carries no people
+    (directors/members), only the legal entity."""
+    out = {"source": "sudreg", "status": "unavailable", "matches": []}
+    try:
+        tok = _sudreg_token()
+    except Exception as e:  # noqa: BLE001
+        out.update(status="failed", error=f"token: {str(e)[:120]}")
+        return out
+    if not tok:
+        out["note"] = ("no SUDREG_CLIENT_ID/SECRET (free registration at sudreg-data.gov.hr)")
+        return out
+    try:
+        if valid_oib(q):
+            ids = [("oib", q)]
+        else:
+            name = q.strip()
+            rows = _sudreg_get(tok, "subjekti", tvrtka_naziv=name, limit=limit)
+            if not rows:
+                core = _CO_SUFFIX.sub("", name).strip(" ,.%")
+                rows = _sudreg_get(tok, "subjekti", tvrtka_naziv=f"%{core}%", limit=15)
+            ids = [("mbs", str(r["mbs"])) for r in rows[:15] if isinstance(r, dict)]
+        for kind, ident in ids:
+            d = _sudreg_get(tok, "detalji_subjekta", tip_identifikatora=kind,
+                            identifikator=ident, expand_relations="true", omit_nulls="true")
+            if not isinstance(d, dict) or not d.get("mbs"):
+                continue
+            sj = d.get("sjediste") or {}
+            cap = (d.get("temeljni_kapitali") or [{}])[-1]
+            gfi = sorted({g.get("godina_izvjestaja") for g in d.get("gfi") or []
+                          if g.get("godina_izvjestaja")})
+            out["matches"].append({
+                "name": (d.get("tvrtka") or {}).get("ime"),
+                "short": (d.get("skracena_tvrtka") or {}).get("ime"),
+                "oib": str(d.get("potpuni_oib") or d.get("oib")),
+                "mbs": str(d.get("potpuni_mbs") or d.get("mbs")),
+                "form": ((d.get("pravni_oblik") or {}).get("vrsta_pravnog_oblika") or {})
+                .get("kratica"),
+                "active": d.get("status") == 1,
+                "bankruptcy": bool(d.get("stecajna_masa")),
+                "liquidation": bool(d.get("likvidacijska_masa")),
+                "founded": (d.get("datum_osnivanja") or "")[:10],
+                "address": " ".join(str(x) for x in (sj.get("ulica"), sj.get("kucni_broj"),
+                                                     sj.get("naziv_naselja")) if x),
+                "court": (d.get("sud_nadlezan") or {}).get("naziv"),
+                "nkd": d.get("glavna_djelatnost"),
+                "capital": f"{cap.get('iznos')} {(cap.get('valuta') or {}).get('naziv', '')}"
+                if cap.get("iznos") else None,
+                "emails": [e.get("adresa") for e in d.get("email_adrese") or [] if e.get("adresa")],
+                "financial_statements_years": gfi[-5:],
+                "last_change": (d.get("vrijeme_zadnje_izmjene") or "")[:10],
+            })
+        # %konzum% also matches "konzumnih jaja": whole-word matches first, then the
+        # shortest names (closest to what was asked), then cap.
+        words = re.findall(r"\w+", _ascii_fold(_CO_SUFFIX.sub("", q)).lower())
+
+        def _rank(c):
+            nm = _ascii_fold(f"{c['name']} {c.get('short') or ''}").lower()
+            whole = all(re.search(rf"\b{re.escape(w)}\b", nm) for w in words)
+            return (not whole, not c["active"], len((c["short"] or c["name"] or "").split()))
+        out["matches"] = sorted(out["matches"], key=_rank)[:limit]
+        out["status"] = "ok"
+    except Exception as e:  # noqa: BLE001
+        out.update(status="failed", error=str(e)[:200])
+    return out
+
+
 def mod_company(q):
     out = {"module": "company", "seed": q, "entities": []}
     try:
         d = _json("https://api.gleif.org/api/v1/lei-records?filter%5Bfulltext%5D="
                   + urllib.parse.quote(q) + "&page%5Bsize%5D=5", timeout=12)
+        # GLEIF fulltext is fuzzy ("Konzum d.d." -> an unrelated real-estate firm):
+        # keep only records whose legal name contains every core word of the query.
+        core = [w for w in re.findall(r"\w+", _ascii_fold(_CO_SUFFIX.sub("", q)).lower())
+                if len(w) > 1]
         for r in d.get("data", []):
             ent = r["attributes"]["entity"]
+            nm = _ascii_fold(ent["legalName"]["name"]).lower()
+            if core and not all(w in nm for w in core):
+                continue
             out["entities"].append({"name": ent["legalName"]["name"],
                                     "country": (ent.get("legalAddress") or {}).get("country"),
                                     "status": ent.get("status"), "lei": r["id"]})
     except Exception:  # noqa: BLE001
         pass
+    out["sudreg"] = sudreg(q)
     out["hint"] = ("GLEIF only covers LEI-registered (mostly regulated/financial) entities. "
                    "For full company intel use the /intel skill: Exa company search, Wikidata, "
                    "national registers (Croatia sudreg, France recherche-entreprises, GLEIF), "
@@ -1597,8 +1736,13 @@ def assemble(query, deep=False, region=None):
     elif t == "phone":
         res["modules"].append(mod_phone(query, region=region))
     elif t == "company":
-        res["modules"].append(mod_company(query))
-        res["modules"].append(mod_news(query))
+        comp = mod_company(query)
+        res["modules"].append(comp)
+        # an OIB is not a press term: search news for the name the register resolved
+        hits = (comp.get("sudreg") or {}).get("matches") or []
+        name = hits[0]["name"] if valid_oib(query) and hits else query
+        if not valid_oib(name):
+            res["modules"].append(mod_news(name))
     else:  # person
         res["modules"].append(mod_news(query))  # local + global news mentions (GDELT)
         res["note"] = ("Person-name detected. Deterministic tools can't resolve a fuzzy name; "
@@ -1755,6 +1899,23 @@ def _print(res):
         elif mod == "company":
             for e in m["entities"]:
                 print(f"    {e['name']}  [{e.get('country')}]  LEI {e['lei']}")
+            sr = m.get("sudreg") or {}
+            if sr.get("status") == "ok" and not sr["matches"]:
+                print("  sudreg (HR court register): no company by that name")
+            elif sr.get("status") != "ok":
+                print(f"  sudreg: {sr.get('status')} {sr.get('error') or sr.get('note') or ''}")
+            for c in sr.get("matches") or []:
+                flags = ", ".join(f for f, on in (("ACTIVE", c["active"]),
+                                                  ("INACTIVE", not c["active"]),
+                                                  ("BANKRUPTCY", c["bankruptcy"]),
+                                                  ("LIQUIDATION", c["liquidation"])) if on)
+                print(f"  sudreg: {c['name']} ({c.get('short') or '-'})  OIB {c['oib']} "
+                      f"MBS {c['mbs']}  [{flags}]")
+                print(f"    {c.get('form')} · founded {c['founded']} · {c['address']} · "
+                      f"NKD {c.get('nkd')} · capital {c.get('capital')}")
+                print(f"    {c.get('court')} · statements filed: "
+                      f"{c['financial_statements_years']} · last change {c['last_change']}"
+                      + (f" · email {', '.join(c['emails'])}" if c["emails"] else ""))
             print("  " + m["hint"])
         elif mod == "github":
             if m.get("status") != "found":
