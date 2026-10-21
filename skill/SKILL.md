@@ -212,9 +212,12 @@ finding as a *claim* with a grade, and run this pass before writing the brief.
    stolen from someone else, or reused across unrelated "identities"? Run `exiftool` on any
    original image for device/geo/timestamp and to spot stripped or spoofed metadata. Watch for
    AI-generation tells. A fake photo collapses a fake identity fast. **C2PA Content
-   Credentials** (`c2patool <img>`, not installed by default) give cryptographic provenance
-   when present: a valid manifest is strong evidence; a *missing* one is `unknown`, because
-   every social platform strips it. And the reverse trap ("liar's dividend"): never call
+   Credentials** (`c2patool <img>`, installed) give cryptographic provenance when present.
+   Read `validation_status` precisely: empty = valid and trusted (strong evidence);
+   `signingCredential.untrusted` = intact but signed by a cert outside the trust list (who
+   signed matters, not tampering); `assertion.dataHash.mismatch` / `claimSignature.mismatch`
+   = edited after signing (real red flag). "No claim found" is `unknown`, because every
+   social platform strips manifests. And the reverse trap ("liar's dividend"): never call
    authentic media fake without positive evidence of manipulation.
 6. **Negative / refutation search (do this explicitly).** Actively search for the claim being
    FALSE: `"<name>" scam|fake|impersonator|debunked|hoax`, fact-check sites, the subject's own
