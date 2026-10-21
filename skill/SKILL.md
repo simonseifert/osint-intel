@@ -1,6 +1,6 @@
 ---
 name: intel
-description: Unified OSINT and intelligence. Auto-detects the target (email, username/handle, domain, company, or a person described by clues) and runs the right modules, then fetches, ANALYZES (text, images, video), and assembles a visual BRIEF (with optional PDF export). Use for "osint X", "check my/this footprint", "who is this username/email", "look up this company/domain", "find the person who <clues>" (akinator), "analyze this brand's socials", "is this email breached", "dig into <company>", "build a brief/dossier on X". Covers people, businesses, brands, domains, breaches, LinkedIn, local news, photos and video. Self / authorized / brand / consenting subjects only.
+description: Unified OSINT and intelligence. Auto-detects the target (email, username/handle, phone number, domain, company, or a person described by clues) and runs the right modules, then fetches, ANALYZES (text, images, video), and assembles a visual BRIEF (with optional PDF export). Use for "osint X", "check my/this footprint" / "how exposed am I" (self-audit mode), "who is this GitHub/Discord account", "who is this username/email", "who is behind this phone number / who called me / is this number spam", "look up this company/domain", "find the person who <clues>" (akinator), "analyze this brand's socials", "is this email breached", "dig into <company>", "build a brief/dossier on X". Covers people, businesses, brands, domains, breaches, LinkedIn, local news, photos and video. Self / authorized / brand / consenting subjects only.
 ---
 
 # intel
@@ -42,9 +42,29 @@ Keep a scratchpad table as you go: `finding | source | confidence | pivots it op
   stealer exposure + holehe (which sites it is registered on).
 - **@username / handle** -> maigret (3000+ sites, metadata, auto-recursion) + other IDs +
   Hudson Rock username exposure.
+- **+43... / 0664...** (phone) -> libphonenumber identity (validity, country, carrier,
+  line type, timezone) + official number-block allocation (AT/RTR, incl. the premium-range
+  service provider's name+address) + crowd spam reports + search-format variants.
 - **domain.com** -> RDAP whois + crt.sh subdomains + oldest Wayback snapshot (public age).
-- **"Acme Ltd"** (company) -> GLEIF entity + LEI + auto GDELT news.
-- **"a person + clues"** -> GDELT news pivot + tells you to run the akinator loop (below).
+- **"Acme Ltd"** (company) -> GLEIF entity + LEI + auto news (legal suffix stripped for
+  the press query; GDELT, falling back to Google News RSS when GDELT 429s or is empty).
+- **"a person + clues"** -> news pivot + tells you to run the akinator loop (below).
+- **github.com/<user>** -> GitHub exposure audit (profile, linked socials, orgs, GPG-key
+  emails, SSH key count, author identities in its own commits: real address vs noreply)
+  + maigret on the handle.
+- **Discord/X numeric ID** (17-20 digits, or `discord.com/users/<id>`) -> snowflake decode:
+  creation time, offline. Names no one.
+- **any other URL** -> the page's preview card + its domain. Profile URLs (x.com,
+  instagram, tiktok, youtube/@, reddit/u, t.me, medium, keybase, gitlab) resolve to the
+  handle; `tel:` / `mailto:` unwrap. Empty input or `file:`/`javascript:` -> `invalid`.
+
+**Read every module's status field literally.** `unavailable` (tool not installed),
+`failed`/`unknown` (rate-limited, CAPTCHA, timeout) and holehe's `COULD NOT CHECK` carry
+NO information; they are never "not found". maigret prints profile hits separately from
+`weak` search/root-page hits (no evidence), and a hit means the *handle exists* there,
+not that it is the same person. Hudson Rock on a username matches the *string*: common
+handles collide, so it is a lead about the handle, never proof about the person.
+Every result carries `retrieved_at`; keep it in the provenance table.
 
 Keyless pivots (each is a separate subcommand, JSON out):
 - `intel news "<name or company>"` - global press mentions, country-tagged (GDELT).
@@ -55,24 +75,42 @@ Keyless pivots (each is a separate subcommand, JSON out):
   (which candidate is a real person's address). Confirm survivors with `intel <email>`.
 - `intel handles "First Last"` - username permutations, GitHub-existence checked as a cheap
   anchor. Run `intel <@handle>` (maigret) on the promising ones.
+- `intel phone <number> [--region=XX]` - force phone mode. A national-format number
+  ("0664...") has no country in it; the CLI assumes AT and SAYS SO (`region_assumed`),
+  because every downstream lookup inherits that guess. Pass `--region` when it is wrong.
 - `intel archive <url>` - Wayback first-seen + latest snapshot + a live-vs-archive text diff
   (catches a stealth-edited source page; banded, and inconclusive on JS-rendered pages).
 - `intel media <profile-or-article-url>` - the preview/headshot image + title a page
   advertises (og:/twitter: card), for Claude to view.
 - `intel embed <image-url>` - fetch an image as a self-contained `data:` URI (for the brief).
+- `intel capture <url> [--no-wayback]` - preserve evidence: raw page + response headers +
+  sha256 + UTC time under `~/.local/share/intel/evidence/`, plus a Wayback Save-Page-Now
+  copy (anonymous tier is slow and often 429s; that is reported, not hidden). Appends to
+  `evidence/log.jsonl`. Capture anything the brief will cite, at the moment you find it.
+- `intel sun <lat,lon> <YYYY-MM-DD[THH:MM]> [shadow_bearing]` - sun azimuth/elevation and
+  shadow direction/length for a place and UTC time; with a measured shadow bearing it
+  returns the UTC time bands that day. Offline (NOAA formula, ~0.5 deg).
 
 Explicit LinkedIn (paid Apify, cookieless, your login never used, ~$0.004/lookup):
 - `intel linkedin <profile-or-company-url>` - full profile or company page.
 - `intel linkedin-search "title location keywords"` - people search ($0.10/page, deliberate).
 `--deep` also auto-enriches any LinkedIn URL a username scan surfaces.
-Tool: `~/Code/personal/intel/intel.py`. Apify token: `~/.config/intel/apify_token`.
+Tool: `intel.py`. Apify token: `~/.config/intel/apify_token`.
 
 ## Investigation loop (find -> verify -> pivot -> fetch -> analyze)
 
+0. **Scope + proportionality (before any person-subject run).** Write down, in one line
+   each: who the subject is to the user (self / consenting / client brand / public figure /
+   other), the purpose, and which fields that purpose actually needs. Collect only those
+   (data minimisation, the Berkeley Protocol rule). If the subject is a private individual
+   with no consent and no legitimate purpose that needs it, stop and say so (see Ethics).
+   **Logging:** keep the scratchpad as an append-only log that includes dead ends and
+   failed lookups, not just hits; "did you only keep what supported the conclusion?" is the
+   first challenge any finding gets. `intel capture <url>` every page the brief will cite.
 1. **Find:** `intel <@handle>` / `intel <email>`. `linkook <handle>` adds a link-graph ->
    pipe to `/graphify`. `theHarvester -d <domain>` aggregates emails/hosts/names for a
-   company. `spiderfoot` (self-host) auto-correlates a name/email/domain/username outward
-   into an entity graph when you want the widest net for non-obvious links.
+   company. (`spiderfoot` would auto-correlate an entity graph, but it is dormant and
+   not built on this box; see Tools inventory.)
 2. **Verify (critical):** finder output is noisy; common names collide. Cross-check display
    name / avatar / bio / linked handles, collapse to one identity, assign confidence, only
    proceed on high/medium. Write down *why* each account is (or is not) the target.
@@ -80,9 +118,8 @@ Tool: `~/Code/personal/intel/intel.py`. Apify token: `~/.config/intel/apify_toke
    (see Mindset). Name -> `intel handles "First Last"` (username variants, GitHub-checked) and
    `intel emailguess "First Last" <domain>` (email variants, Gravatar-checked) to systematize
    the approximations. Reused handle -> `intel <@that-handle>`. Distinctive bio phrase -> dork
-   it. Employer -> `intel linkedin-search`. Phone -> `phoneinfoga scan -n <+E164>`. Local
-   angle -> `intel localnews`. Legal angle -> `intel court`. Widest net for non-obvious links
-   -> `spiderfoot`.
+   it. Employer -> `intel linkedin-search`. Phone -> `intel phone <number>` (phoneinfoga is unmaintained; see the phone section). Local
+   angle -> `intel localnews`. Legal angle -> `intel court`.
 4. **Fetch content** with a tool you already have (route by platform):
    IG -> `reach` (Apify) / `instaloader` / `agent-reach`. X -> `agent-reach`. Reddit ->
    `reach`. YouTube -> `reach` (transcripts). LinkedIn -> `intel linkedin`. TikTok/FB ->
@@ -114,11 +151,22 @@ the brief **displays**.
 - **Authenticity (part of the truth factor):** `exiftool <image>` for device/geo/timestamp
   and to catch stripped/spoofed metadata; reverse-image (browse -> Yandex/Lens) to see if a
   "headshot" is stock, stolen, or reused across identities. See Verification below.
-- **Geolocation (when a photo's location matters):** first `exiftool` for embedded GPS. If
-  stripped (usual on social uploads), Claude reasons from visual cues, signage/language,
-  license-plate format, architecture, vegetation/climate, and sun position/shadow direction
-  (shadow angle + timestamp roughly fixes latitude/orientation), then confirms against map
-  imagery. Treat the result as an inference to verify, never a certainty.
+- **Geolocation, then chronolocation (where first, then when).** Use only for the
+  subject's own/consented media or public-interest verification (is this news photo really
+  from where it claims?), never to locate a private person.
+  1. `exiftool` for embedded GPS/time. Social uploads strip it; absence is normal, not
+     suspicious.
+  2. **Anchor on searchable features, not atmosphere:** shop names and signage text,
+     distinctive facades, road furniture (bollards, kerb paint, sign shapes), plate format,
+     language/script, power poles. One searchable string beats ten "looks Mediterranean".
+  3. Narrow region -> candidate spot, then confirm against Street View / map imagery. Use
+     Street View's **"See more dates"**: an older capture may lack a newer building.
+  4. **When:** measure the camera heading and a shadow's bearing on the map (Google Earth
+     ruler along a straight shadow edge), then `intel sun <lat,lon> <date> <bearing>` for the
+     UTC time bands. Shadows are least diagnostic near solar noon (bands widen); date
+     itself needs other evidence (weather history, foliage, posters, construction state).
+  5. Output = coordinates + heading + time band + confidence + **"what would falsify
+     this"**. It is an inference, never a certainty.
 
 **Video:**
 - Transcript without downloading video: `yt-dlp --write-auto-subs --skip-download
@@ -163,7 +211,11 @@ finding as a *claim* with a grade, and run this pass before writing the brief.
 5. **Media authenticity.** Reverse-image the headshot (browse -> Yandex/Lens): is it stock,
    stolen from someone else, or reused across unrelated "identities"? Run `exiftool` on any
    original image for device/geo/timestamp and to spot stripped or spoofed metadata. Watch for
-   AI-generation tells. A fake photo collapses a fake identity fast.
+   AI-generation tells. A fake photo collapses a fake identity fast. **C2PA Content
+   Credentials** (`c2patool <img>`, not installed by default) give cryptographic provenance
+   when present: a valid manifest is strong evidence; a *missing* one is `unknown`, because
+   every social platform strips it. And the reverse trap ("liar's dividend"): never call
+   authentic media fake without positive evidence of manipulation.
 6. **Negative / refutation search (do this explicitly).** Actively search for the claim being
    FALSE: `"<name>" scam|fake|impersonator|debunked|hoax`, fact-check sites, the subject's own
    denial. Absence of a debunk is not proof, but a debunk is often decisive.
@@ -189,6 +241,15 @@ finding as a *claim* with a grade, and run this pass before writing the brief.
     the *absence* of evidence. `intel handles` returns `identifying_signal` per hit and lists
     `ghost_accounts` for exactly this reason. When only the subject or a human with ground
     truth can settle it, say so instead of guessing.
+11. **Every link has an as-of date; eras need a bridge.** A 2016 breach email and a 2026
+    profile only describe the same living identity if something connects them across time
+    (the old address in a recent profile, a continuous handle history). People change
+    jobs, cities, and handles; recycled usernames and reassigned phone numbers are common.
+    Put the date of each finding (`retrieved_at` + the source's own date) in the provenance
+    table and flag stale-only chains.
+12. **Breach-derived findings are labelled `provenance: breach`.** They are useful leads
+    and legal to look up, but tainted for any formal use and often outdated. Never present
+    them as current fact, and never include passwords or full leaked records in a brief.
 
 ### The evaluator (independent adversarial pass)
 
@@ -202,11 +263,46 @@ red flags and gaps. Only claims that survive go in as FACT. For high-stakes subj
 3 skeptics and majority-vote (the adversarial-verify pattern). This is the "true factor":
 a dedicated, independent check whose job is to disbelieve.
 
+## SELF-AUDIT: look me up like a scammer, then fix it
+
+The highest-value use of this toolkit, and the cleanest ethically: the user (or a consenting
+person) is the subject. Trigger: "check my footprint", "what can people find about me",
+"how exposed am I", "self-audit".
+
+1. **Collect identifiers** the person gives you: emails (all of them, old ones matter
+   most), handles, phone, domains, GitHub. Do not go hunting for identifiers they did not
+   give; ask instead.
+2. **Run every module** on each: `intel <email>` (breach sources, stealer exposure,
+   registrations), `intel @handle`, `intel phone`, `intel <domain>` (whois privacy, old
+   subdomains), `intel github.com/<user>` (real address in commit metadata is the classic
+   finding), `intel handles "First Last"`, `intel localnews "<name>" hr`, plus the format
+   dorks for the phone and the name via `ddgs`.
+3. **Think like the attacker**, not the scanner: what would a scammer *do* with this? A
+   breach with passwords + a reused handle = account takeover risk; phone + employer +
+   photo = a convincing vishing pretext (the carrier social-engineering demo pattern:
+   spoofed caller ID + urgency + one small piece of real info); an exposed home address
+   or a daily-routine pattern in posts = physical risk.
+4. **Output an exposure table, ranked:** `item | where | who can see it | severity |
+   fix | status`. Severity: credential/stealer exposure > address/routine > phone+employer
+   pretext material > old accounts > cosmetic.
+5. **Fix actions** (concrete, not advice-shaped):
+   - stealer or breach-with-password hits -> rotate those passwords, enable 2FA, check
+     the infected machine (Hudson Rock = malware on a device, not just a site breach).
+   - dead accounts -> delete via JustDeleteMe (justdeleteme.xyz) direct links.
+   - Google results -> "Results about you" (myactivity.google.com/results-about-you)
+     removal requests for contact info.
+   - EU data holders (B2B enrichers: Apollo, ZoomInfo, RocketReach, Lusha,
+     PeopleDataLabs; data brokers) -> GDPR Art. 15 access / Art. 17 erasure requests.
+     Draft them (EN or HR) for the user to send; never send on their behalf.
+   - GitHub real address in commits -> set a noreply address for future commits.
+   - phone -> "Ne zovi" register (HR), unlist from Truecaller-style apps.
+6. **Re-run quarterly and diff** against the last table; new exposure is the signal.
+
 ## The BRIEF deliverable (the output the user wants)
 
 A visual dossier: headshot + a tight highlights box + sections + sources, exportable to PDF.
 
-1. Copy the template: `~/Code/personal/intel/brief_template.html`.
+1. Copy the template: `brief_template.html`.
 2. Fill the `{{...}}` slots from your scratchpad. Sections: highlights (4 to 7 punchy
    bullets, the things that matter most), Identity & Presence (accounts table with a
    confidence chip each), Media (headshot + notable images/clips), Analysis (what the
@@ -240,8 +336,47 @@ dossier. Offer the PDF; do not always generate it.
 - **History + reputation:** Wayback CDX, HN Algolia (`hn.algolia.com/api`), reviews via
   `firecrawl`. **Investigative/leaks:** OCCRP Aleph (Balkan-strong; metadata keyless),
   DocumentCloud (`api.www.documentcloud.org/.../search`), ICIJ Offshore Leaks (manual pivot).
-- **Sanctions/PEP:** OpenSanctions (bulk data CC-BY, or self-host `yente`; hosted API keyed).
+- **Sanctions/PEP:** OpenSanctions. The hosted API now needs a key (401 without); bulk data
+  is keyless at `data.opensanctions.org/datasets/latest/default/` (names.txt ~110 MB: grep
+  it locally) or self-host `yente`.
+- **Croatia, keyless (all verified live 2026-10-21; company/legal research only):**
+  - `e-oglasna.pravosudje.hr` - court notices: bankruptcy, enforcement, auctions.
+  - `odluke.sudovi.hr` - anonymised court decisions, searchable by company/topic.
+  - `rgfi.fina.hr/JavnaObjava-web/` - FINA annual financial statements, free.
+  - `pretrazivac-obrta.gov.hr` - sole-trader (obrt) register, which sudreg does not cover.
+  - `sukobinteresa.hr` - officials' asset declarations (public office holders only).
+  - `companywall.hr/tvrtka/...`, `fininfo.hr/Poduzece/...` - single company pages (OIB,
+    status) return 200; fetch one page on demand, never crawl (robots blocks search and
+    owner graphs). `poslovna.hr` is login/trial only.
+  - `sudreg-data.gov.hr` is NOT keyless: free registration -> OAuth2 client id/secret.
+    Best HR anchor (OIB/MBS, officers, status) once you register.
+  - `data.gov.hr` CKAN API (`/ckan/api/3/action/package_search?q=`) - association and
+    other public registers.
+  - Out of scope: the land registry (`oss.uredjenazemlja.hr`) is public but is a
+    person-locating tool; do not use it on individuals.
+- **EU beneficial ownership:** UBO registers have been closed to the general public since
+  the 2022 CJEU ruling; access now needs a "legitimate interest". A missing UBO record
+  means "not visible to us", never "no owner". BRIS (e-justice.europa.eu) is free but
+  browser-only.
 Then run the fetch->analyze->brief pipeline on the brand's official socials.
+
+## Platform notes (what each one actually exposes)
+
+- **GitHub:** `intel github.com/<user>`. Commit author name/email is self-asserted by
+  whoever ran `git commit` (grade C, can be anything), but a consistent real address
+  across years of commits is a strong lead. SSH-key count and GPG-key emails are public
+  by design. The events API stopped carrying commit lists in 2025; the CLI reads commits
+  per repo instead (5 most recently pushed own repos, 30 commits each).
+- **Discord:** usernames are unique handles, but there is **no keyless lookup** by
+  username or ID. What is public: the ID itself dates the account (`intel <id>`). Profile
+  fields need a bot token or a logged-in client; do not use self-bots or user-token
+  scrapers (ToS violation, account ban), and do not join servers to observe a subject.
+  maigret's Discord "hit" is a root-page false positive. The realistic pivots are the
+  handle string itself (`intel @handle`: people reuse it) and anything the person links
+  publicly (bio links, a GitHub/Steam/Twitch profile naming the same handle).
+- **Handles in general:** a username match proves the string exists, not the person.
+  Confirm with a bridge: one profile linking to the other, the same uncommon avatar,
+  the same uncommon bio phrase, or a consistent cross-platform timeline.
 
 ## The AKINATOR resolver (name a person/company from clues)
 
@@ -265,7 +400,10 @@ handle surfaces, pivot to `intel <@handle>`.
 
 Do not scrape Google (ToS + instant block). Use `ddgs` (keyless, honors
 `site:`/`filetype:`/`intitle:`) and, if keyed, Serper (2,500 free) for full Google dork
-operators. Pull dork templates from the GHDB corpus per task. `reach` wraps Exa/Jina/
+operators. **`reach search` is NOT a dork engine:** it falls through Exa -> SearXNG, and
+SearXNG ignores `site:` (checked 2026-10-21), so operator queries go to `ddgs` only. Exa
+indexes little non-English local content; for Croatian sources SearXNG/ddgs found what
+Exa did not. The Bing Search API was retired 2025-08-11; ignore any guide built on it. Pull dork templates from the GHDB corpus per task. `reach` wraps Exa/Jina/
 Firecrawl; `mcp__grep__searchGitHub` dorks GitHub for leaked emails/handles.
 
 ## Reverse image (light, and the red line)
@@ -280,23 +418,128 @@ is this person's face", which is the surveillance line.
 
 `intel <email>` and `intel <@username>` both run Hudson Rock (infostealer-log exposure).
 `intel <email>` also runs LeakCheck public (breach source names, not passwords) and holehe.
+holehe's last release is 2024-09 and on a 2026-10 test 77 of 123 modules returned
+could-not-check (rate limit / CAPTCHA). Its `used` hits are decent leads; its `not used`
+is weak evidence (a stale module can miss a live account) and `COULD NOT CHECK` is none.
+A sound replacement candidate is `sharsil/mailcat` (active), not yet source-reviewed.
 HIBP Pwned Passwords (`api.pwnedpasswords.com/range/`) is keyless k-anonymity for password
 checks. HIBP email/domain breach API is $3.50/mo (optional).
 
+## PHONE numbers (who is behind this call)
+
+`intel phone <number>` does the deterministic half. The judgement half is below. Run the
+ladder in order; stop as soon as the number is explained.
+
+**1. Identity of the line (offline, unfalsifiable).** Validity, country, carrier, line
+type, timezone via libphonenumber. Read `line_type` as triage, not trivia:
+`voip`/`uan`/`premium_rate` are the cheap, recyclable, spoofable ranges a call centre
+actually dials from; a real `mobile` on a real carrier behaves differently. `valid:false`
+or an unallocated range means the caller ID was **forged** and there is no subscriber to
+find - stop investigating the number and start investigating the campaign.
+
+**2. Official allocation (the hard anchor).** Regulators publish which operator holds each
+number block, and this is a government record, not a crowd guess - grade it A1.
+- **AT: wired.** RTR, automatic in the CLI. For premium ranges ((0)900/901/810/820/930/
+  931/939) it returns the service provider's **name and address outright** - that is the
+  single highest-value keyless answer to "who is behind this number", and it exists
+  because premium-rate operators must be publicly identifiable.
+- **HR: links only.** HAKOM's two useful lookups are image-CAPTCHA gated, so the CLI
+  hands over the URLs (never bypass a CAPTCHA): **e-Prenosivost** (the network the number
+  is on *now*; 098/099/091/095 are only the *original* ranges and numbers port) and the
+  **"Ne zovi" register** (whether telemarketing to a number is illegal). Neither names a
+  subscriber. HAKOM has no public porting API.
+- **Not wired, check by hand:** DE `bundesnetzagentur.de` (+ its premium-number search at
+  `nvmwd.bundesnetzagentur.de`), CH `bakom.admin.ch`. Most EU regulators publish an
+  equivalent.
+- Ordinary end subscribers are **not** public anywhere in the EU. If the number is a
+  normal mobile, the operator name is the end of the official trail. Say so plainly
+  rather than implying more is obtainable.
+
+**3. Crowd reputation (soft, and actively booby-trapped).**
+- `spamcalls.net` - wired. **The trap:** an unlisted number does not 404, it redirects to
+  a numerically *adjacent* listed number whose page returns 200 with a lurid "Scam Call
+  (508 reports)" title. PhoneInfoga-era scripts and Phunter's `spam.py` read `status ==
+  200` as "spammer" and so invent reports for clean numbers. The CLI compares the final
+  URL's digits to the queried digits; keep that guard if you touch it.
+- `werruft.info` - wired, DE/AT/CH. Answers 200 for *every* number, so the rating counts
+  are the signal and the status code is worthless. `ratings=0` = nobody reported it.
+- `tellows.{at,de}` - the best DE/AT score, now Cloudflare-gated. The CLI returns
+  `status: blocked` **with the URL** rather than pretending it found nothing; open it with
+  `browse goto <url>`. A source you could not read must never look like a source that
+  said "clean". There is no tellows.hr (NXDOMAIN); other countries return `unsupported`.
+- **Croatia - the strongest crowd layer we have, wired:** `tko-me-zvao.com.hr` (spam/OK
+  votes + comments) and `ciji-broj.hr` (ratings, comments, verdict), both HR-only, plus
+  `telefonbroj.com` (any country). Both HR sites 404 an unreported number, which is a clean
+  `not_listed`. tko-me-zvao silently prefixes 385 to any number, so never call it for a
+  foreign one. **Read the `latest` comments, they are the payload:** on 2026-10-13 they
+  identified 098 155 221 as Hrvatski Telekom's outbound sales line ("calling back gets an
+  HT recording", HT products pitched, callers knowing the person was an HT/Iskon customer),
+  which no register would ever say. Exa has none of these indexed; SearXNG found them.
+- **Truecaller / Viber caller ID: manual only.** Look the number up in the app and
+  pastes the result (spam count, carrier label). Reputation is useful; a *name* there is
+  usually someone else's address-book label, so it is never evidence (see below).
+- Crowd reports are self-published, unverifiable and gameable: grade them **D-level, and
+  count reporters, not reports.** They establish *that people are being called*, never
+  *who is calling*.
+
+**4. The format pivot (where the number actually leaks).** Search engines index the
+*format a human typed*, not E.164, so one query on `+436641234567` misses the page that
+wrote `0664 123 45 67`. The CLI emits every variant plus ready dorks - run them through
+`ddgs`/`reach`. A business number almost always surfaces in an imprint, a classified ad
+(willhaben/kleinanzeigen), a scraped directory or a PDF, and *that* is what names people.
+
+**5. Messaging apps (the strongest soft pivot, and you may already own an account).** A
+number registered on WhatsApp often exposes a profile photo, an "about", and - if it is a
+**business** account - a verified business name. Use the whatsapp MCP `lookup_identity`
+and `get_profile_picture` on your own bridge, then Claude views the photo and
+reverse-images it. Caveat: `lookup_identity` only searches your *own* bridge history,
+so `found:false` means "never talked to", NOT "not on WhatsApp". Telegram/Viber/Signal
+similarly leak presence (bellingcat/telegram-phone-number-checker works, needs a burner
+Telegram account). Treat presence as a lead, absence as nothing (the three-state rule).
+
+**5b. Account existence (opt-in, `intel phone <n> --accounts`).** phonsint, pinned and
+source-reviewed, in its own venv, limited to the silent Microsoft / Amazon / Zoho checks
+(yes/no per site). Do NOT enable its `instagram` (it solves Instagram's anti-bot
+proof-of-work) or `facebook` (account recovery returns the holder's real name and photo)
+modules, never pass `--allow-loud`, and never use `nabz0r/modern-phone-checker`: its
+Instagram and Telegram checks SEND a reset / login code to the owner. Anything that can
+reach the owner's phone tips them off and is harassment.
+
+**6. Austrian white pages:** `browse goto https://www.herold.at/telefonbuch/was_wer/<national>/`
+- a JS app with no API, so it needs the headless browser. Only lists *listed* subscribers.
+
+**Do not** route this into paid people-search / Truecaller-style databases. Truecaller's
+"name" comes from other people's uploaded address books, i.e. from contacts who never
+consented to being the source - it is the phone equivalent of the facial-recognition red
+line, and it is also frequently wrong.
+
+**The honest ending.** For an ordinary spoofed spam call the correct, complete answer is
+usually: *the caller ID is forged, the range belongs to operator X, N strangers report the
+same pattern, and the subscriber is not publicly obtainable.* Deliver that as a result,
+not as a failure, and point at the lever that does work: report it to RTR
+(Rufnummernmissbrauch) or the Bundesnetzagentur, who can compel the operator to unmask it.
+
 ## Tools inventory
 
-Keyless CLIs (installed, on PATH): `intel`, `maigret`, `holehe`, `linkook`, `sherlock`,
-`theHarvester` (domain/company email+host aggregation), `gallery-dl` (photo collection),
-`yt-dlp` + `youtube_transcript_api` (video/transcript), `exiftool` (image metadata/
-authenticity), `phoneinfoga` (phone OSINT: `phoneinfoga scan -n <+E164>`), `ddgs`,
-`edgartools`, `whois`/`dig`/`nmap`. Heavy correlation: `spiderfoot` at
-`~/Code/tools/spiderfoot` (its own venv: `~/Code/tools/spiderfoot/.venv/bin/python sf.py -s
-<target> -q` for CLI, or `... sf.py -l 127.0.0.1:5001` for the web UI) - auto-expands a
-name/email/domain/username into an entity graph. Fetchers you already have: `reach`
-(Exa/Jina/Firecrawl/search/IG/Reddit/YouTube), `agent-reach` (cookie social), `instaloader`,
-`firecrawl`, `crawl4ai`, `browser-use`, `browse` (headless Chrome, has `pdf`). PDF:
-`make-pdf`/`pdf` skills. Paid-per-run: Apify actors via `intel linkedin*` (harvestapi
-LinkedIn, apidojo X, compass Maps, clockworks TikTok).
+**Check before you plan, never trust this list blindly** (tools rot, machines differ):
+`for t in maigret holehe sherlock gallery-dl ddgs exiftool whois theHarvester subfinder
+yt-dlp; do printf '%-12s %s\n' $t "$(command -v $t || echo MISSING)"; done`
+
+Tool health as of 2026-10: maigret, sherlock, theHarvester, subfinder, WhatsMyName,
+blackbird = active. holehe = stale (see Breach). PhoneInfoga = docs-only commits.
+SpiderFoot = dormant since 2023-11; treat it as unavailable unless you build it. Dropped: social-analyzer (crash bug), h8mail (dead
+2022), Eyes (archived), amass (v5 removed `intel`), crawl4ai (reach covers it),
+castrickclues (domain gone).
+
+Fetchers: `reach` (Exa/Jina/Firecrawl/search/IG/Reddit/YouTube; Jina, Firecrawl and the
+Apify-backed Reddit route can run out of credits, so check `reach doctor` when results
+look empty), `agent-reach` (cookie social), `browser-use`, `browse` (headless Chrome, has
+`pdf`). PDF: `make-pdf`/`pdf` skills. Paid-per-run: Apify actors via `intel linkedin*`.
+
+**Manual-only services (use in the browser, never wire):** Epieos free tier (30/mo),
+Predicta Search free tier (check that any image search is not face matching first),
+IntelTechniques tools (query builders that run in your browser), BRIS. OSINT Industries
+(from GBP 19/mo) relies on account-recovery and private-API checks, so manual at most.
 
 ## Ethics / scope
 
@@ -313,3 +556,23 @@ scraped face corpus. The principle: general reverse image search ("where else is
 image") is fine; matching a person's face across images they never consented to link is not.
 Also skip keyed-now-not-keyless services (OpenCorporates, IntelX, OsintCat APIs) unless a key
 is deliberately added.
+
+**Also never wire:**
+- Phone-to-name people search: StoryCheck ($29.99/week, licensed broker data), Truecaller
+  private-API wrappers.
+- Anything that contacts or notifies the subject: password-reset or login-code probes
+  (`modern-phone-checker`), phonsint's loud modules, joining a subject's Discord server
+  or following them to see more.
+- Account-takeover-adjacent tooling: GHunt (needs logged-in Google cookies, private API),
+  Discord self-bots or user-token scrapers.
+- CAPTCHA or bot-wall solvers, including Scrapling's stealth/Turnstile mode. Its plain
+  fetcher is fine.
+- Tracking links or IP loggers ("send them a link and get their location"): that is
+  active deception of the subject, not OSINT.
+
+**Proportionality is the gate, not the tool list.** The same lookup is fine for
+self-audit, a consenting person, a company, or a public figure's public role, and is not
+fine for profiling a private individual who has not consented and where no legitimate
+purpose needs it (an ex, a stranger from a game, a neighbour). In that case say so plainly
+and offer what is legitimate instead: blocking and reporting on the platform, the
+platform's own safety tools, or a lawyer/police report if there is a real threat.
