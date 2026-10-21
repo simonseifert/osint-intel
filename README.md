@@ -4,7 +4,7 @@
 
 **One command. Point it at anything. Get a graded intelligence brief.**
 
-Auto-detects whether your target is an email, a username, a domain, a company, or a
+Auto-detects whether your target is an email, a username, a phone number, a domain, a company, or a
 person-from-clues, runs the right keyless recon, verifies findings against planted
 disinformation, and assembles a printable dossier.
 
@@ -31,6 +31,7 @@ One entry point. It figures out the target type and dispatches:
 |---|---|
 | `intel <email>` | Gravatar profile + LeakCheck breach sources + Hudson Rock stealer exposure + holehe |
 | `intel <@username>` | maigret across 3000+ sites + Hudson Rock username exposure |
+| `intel <+43...>` / `intel phone <n>` | libphonenumber identity (validity, carrier, line type, tz) + official number-block allocation (AT/RTR, incl. premium-range service provider name+address) + crowd spam reports (exact-match guarded; spamcalls + telefonbroj everywhere, tko-me-zvao.com.hr + ciji-broj.hr for HR, with latest comments) + HAKOM links for HR (CAPTCHA-gated, manual) + search-format variants. `--accounts` adds silent Microsoft/Amazon/Zoho existence checks via phonsint |
 | `intel <domain.com>` | RDAP whois (with system-`whois` ccTLD fallback) + crt.sh subdomains + oldest Wayback snapshot |
 | `intel "Acme Ltd"` | GLEIF legal entity + LEI + recent news |
 | `intel "Name + clues"` | news pivot + the akinator-style resolver loop |
@@ -43,6 +44,8 @@ intel localnews "<name>" hr           # native local-language press (hr/rs/ba/si
 intel court "<name>"                  # US federal dockets + opinions (CourtListener)
 intel emailguess "First Last" x.com   # email-pattern permutations, Gravatar-verified
 intel handles "First Last"            # username permutations, GitHub-existence checked
+intel phone "+43 664 123 4567"        # phone: line identity + allocation + spam reports
+intel phone "0664 1234567" --region=AT # national format needs a country (assumed + flagged)
 intel archive <url>                   # Wayback first-seen + latest + live-vs-archive diff (tamper)
 intel media <url>                     # the headshot/preview image a page advertises
 intel embed <image-url>               # image -> self-contained data: URI (for the brief)
@@ -92,6 +95,10 @@ Core is Python 3.9+ **stdlib only**. The finder modules shell out to a few well-
 
 ```bash
 pipx install maigret holehe          # username + email finders
+# optional, for phone: offline carrier/line-type metadata (Google's libphonenumber)
+python3 -m venv ~/.local/share/intel/venv && ~/.local/share/intel/venv/bin/pip install phonenumbers
+# optional, for `intel phone --accounts` (pinned to the source-reviewed commit)
+python3 -m venv ~/.local/share/intel/phonsint-venv && ~/.local/share/intel/phonsint-venv/bin/pip install "git+https://github.com/kaifcodec/phonsint@f1f37480d088"
 brew install exiftool whois          # image metadata + ccTLD whois (optional)
 # optional pivots: gallery-dl, yt-dlp, theHarvester, phoneinfoga
 
