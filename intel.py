@@ -25,18 +25,19 @@ Pivots (keyless):
                                           sun/shadow geometry; bearing -> UTC time bands
     intel <github-url | discord-id>       GitHub exposure audit / snowflake account date
 
-Deep (paid, Apify) LinkedIn on demand:
-    intel linkedin <profile-or-company-url>     harvestapi (cookieless, ~$0.004);
-                   [--fresh]                    $0 when corpus already holds it
+Deep (paid) LinkedIn on demand:
+    intel linkedin <profile-or-company-url>     corpus ($0) -> HarvestAPI ($0.004)
+                   [--fresh]                    -> Apify; prints vendor and cost
     intel linkedin-search "title location ..."  people search ($0.10/page)
 
 Content back-catalogue (passes through to the separate `corpus` tool):
     intel content add <url> --relationship own|client|competitor|influencer
     intel content sync|comments|analyze|brief|find|search|profile|health ...
 
-Flags: --json  --deep (paid Apify enrichment of found LinkedIn URLs)  --region=XX (phone).
-Keyless by default; Apify token from ~/.config/intel/apify_token, $INTEL_APIFY_TOKEN or
-APIFY_TOKEN in ~/.reach/keys.env. corpus via $INTEL_CORPUS_CMD / ~/.config/intel/corpus_cmd.
+Flags: --json  --deep (paid enrichment of found LinkedIn URLs)  --region=XX (phone).
+Keyless by default. HARVESTAPI_KEY from the env or ~/.reach/keys.env; Apify token from
+~/.config/intel/apify_token, $INTEL_APIFY_TOKEN or APIFY_TOKEN in ~/.reach/keys.env.
+corpus via $INTEL_CORPUS_CMD / ~/.config/intel/corpus_cmd.
 Self / authorized / brand / consenting subjects only.
 """
 import base64
@@ -1547,33 +1548,90 @@ def corpus_passthrough(args):
     return subprocess.call(argv)
 
 
+# ---------------- HarvestAPI (direct, paid per request) ----------------
+#
+# The company behind the harvestapi/* Apify actors also sells the same scrapers as a
+# plain REST API. Same payload, $0.004 per profile (main=true) or company lookup
+# (measured 2026-10-23), no Apify plan needed, and every response states its own
+# price in `cost`. So it goes first and Apify is the fallback.
+
+_HARVESTAPI = "https://api.harvestapi.io"
+
+
+def harvestapi(path, params, timeout=60):
+    """GET one HarvestAPI endpoint. Returns the parsed body, or {"error", "fallback"}:
+    fallback=False means the vendor answered and the TARGET is the problem (not found,
+    private), so paying a second vendor for the same miss is pointless."""
+    key = _keys_env("HARVESTAPI_KEY")
+    if not key:
+        return {"error": "no HARVESTAPI_KEY (env or ~/.reach/keys.env)", "fallback": True}
+    url = f"{_HARVESTAPI}{path}?{urllib.parse.urlencode(params)}"
+    req = urllib.request.Request(url, headers={**UA, "X-API-Key": key})
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            d = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        body = e.read()[:300].decode(errors="replace")
+        return {"error": f"harvestapi {e.code}: {body[:160]}", "fallback": e.code not in (404,)}
+    except (urllib.error.URLError, TimeoutError, ValueError) as e:
+        return {"error": f"harvestapi unreachable: {e}", "fallback": True}
+    if not isinstance(d, dict):
+        return {"error": "harvestapi: unexpected response", "fallback": True}
+    if d.get("error"):
+        return {"error": f"harvestapi: {str(d['error'])[:160]}", "fallback": False,
+                "cost": d.get("cost")}
+    if not d.get("element"):
+        return {"error": "harvestapi: empty result", "fallback": False, "cost": d.get("cost")}
+    return d
+
+
 def linkedin(url, fresh=False, max_age_days=CORPUS_MAX_AGE_DAYS):
-    # Input keys come from the actor's own schema
-    # (GET /v2/acts/<actor>/builds/default/openapi.json), not from guessing:
-    # a wrong key makes the run SUCCEED with an empty dataset rather than error,
-    # which is how "profileUrls" silently returned nothing here until 2026-08-05.
+    """corpus ($0, if it already holds a full fresh profile) -> HarvestAPI direct
+    ($0.004) -> Apify actor. Every result says which vendor answered (`vendor`,
+    `source`) and what it cost (`cost_usd`; None when the vendor does not say)."""
     module = "linkedin-company" if "/company/" in url else "linkedin-profile"
-    # corpus runs the SAME harvestapi actors and keeps the raw payload, so a stored
+    today = time.strftime("%Y-%m-%d", time.gmtime())
+    # corpus runs the SAME harvestapi scrapers and keeps the raw payload, so a stored
     # profile is byte-compatible with a fresh one. Only a full profile counts (the
-    # posts actor leaves a name/headline stub), and only within max_age_days.
+    # posts feed leaves a name/headline stub), and only within max_age_days.
     cached = {"status": "skipped (--fresh)"} if fresh else corpus_profile(url)
     if cached.get("status") == "found":
         age = (time.time() - (cached.get("last_scraped_at") or 0)) / 86400
         if cached.get("complete") and age <= max_age_days:
-            return {"module": module, "source": "corpus (stored, $0)",
+            return {"module": module, "source": "corpus (stored, $0)", "vendor": "corpus",
+                    "cost_usd": 0.0,
                     "as_of": time.strftime("%Y-%m-%d", time.gmtime(cached["last_scraped_at"])),
                     "relationship": cached.get("relationship"),
                     "data": [cached["profile"]]}
         cached = {"status": "stale" if cached.get("complete") else "stub only",
                   "age_days": round(age)}
     if module == "linkedin-company":
+        hv = harvestapi("/linkedin/company", {"query": url})
+    else:
+        # main=true: the short profile ("linkedinProfileShort"), the cheap tier.
+        hv = harvestapi("/linkedin/profile", {"query": url, "main": "true"})
+    if not hv.get("error"):
+        cost = hv.get("cost")
+        return {"module": module, "vendor": "harvestapi", "cost_usd": cost,
+                "source": f"harvestapi (paid, ${cost if cost is not None else '?'})",
+                "as_of": today, "corpus": cached.get("status"), "data": [hv["element"]]}
+    if not hv.get("fallback"):
+        return {"module": module, "vendor": "harvestapi", "cost_usd": hv.get("cost"),
+                "source": "harvestapi (target not found, no fallback)", "as_of": today,
+                "corpus": cached.get("status"), "data": {"error": hv["error"]}}
+    # Input keys come from the actor's own schema
+    # (GET /v2/acts/<actor>/builds/default/openapi.json), not from guessing:
+    # a wrong key makes the run SUCCEED with an empty dataset rather than error,
+    # which is how "profileUrls" silently returned nothing here until 2026-08-05.
+    if module == "linkedin-company":
         data = run_actor("harvestapi/linkedin-company", {"companies": [url]}, max_charge=0.05)
     else:
         data = run_actor("harvestapi/linkedin-profile-scraper", {"urls": [url]},
                          max_charge=0.05)
-    return {"module": module, "source": "apify (paid, ~$0.004)",
-            "as_of": time.strftime("%Y-%m-%d", time.gmtime()),
-            "corpus": cached.get("status"), "data": data}
+    return {"module": module, "vendor": "apify", "cost_usd": None,
+            "source": "apify (paid, ~$0.004, capped at $0.05)",
+            "as_of": today, "corpus": cached.get("status"),
+            "harvestapi": hv["error"], "data": data}
 
 
 def linkedin_search(query, limit=10):
@@ -2135,7 +2193,8 @@ def main(argv=None):
     elif "module" in out:
         if out.get("source"):
             print(f"# source: {out['source']}, as of {out.get('as_of')}"
-                  + (f", corpus: {out['corpus']}" if out.get("corpus") else ""))
+                  + (f", corpus: {out['corpus']}" if out.get("corpus") else "")
+                  + (f", harvestapi: {out['harvestapi']}" if out.get("harvestapi") else ""))
         print(_clean(json.dumps(out.get("data", out), indent=2, ensure_ascii=False)[:4000]))
     else:
         buf = io.StringIO()

@@ -1,6 +1,6 @@
 ---
 name: intel
-description: Unified OSINT and intelligence. Auto-detects the target (email, username/handle, phone number, domain, company, or a person described by clues) and runs the right modules, then fetches, ANALYZES (text, images, video), and assembles a visual BRIEF (with optional PDF export). Use for "osint X", "check my/this footprint" / "how exposed am I" (self-audit mode), "who is this GitHub/Discord account", "who is this username/email", "who is behind this phone number / who called me / is this number spam", "look up this company/domain", "find the person who <clues>" (akinator), "analyze this brand's socials", "is this email breached", "dig into <company>", "build a brief/dossier on X". Also the front door to `corpus` (content mode): "download/pull someone's LinkedIn, Instagram or YouTube Shorts", "content audit of X", "what is working for <competitor/creator>", "compare my client with competitors", "which competitor posts are blowing up", "brief on my/client's content", "track this profile". Covers people, businesses, brands, domains, breaches, LinkedIn (profiles AND post back-catalogues), local news, photos and video. Self / authorized / brand / consenting subjects only.
+description: Unified OSINT and intelligence. Auto-detects the target (email, username/handle, phone number, domain, company, or a person described by clues) and runs the right modules, then fetches, ANALYZES (text, images, video), and assembles a visual BRIEF (with optional PDF export). Use for "osint X", "check my/this footprint" / "how exposed am I" (self-audit mode), "who is this GitHub/Discord account", "who is this username/email", "who is behind this phone number / who called me / is this number spam", "look up this company/domain", "find the person who <clues>" (akinator), "analyze this brand's socials", "is this email breached", "dig into <company>", "build a brief/dossier on X". Also the front door to `corpus` (content mode): "download/pull someone's LinkedIn, Instagram, TikTok, Facebook page or YouTube Shorts", "content audit of X", "what is working for <competitor/creator>", "compare my client with competitors", "which competitor posts are blowing up", "brief on my/client's content", "track this profile". Covers people, businesses, brands, domains, breaches, LinkedIn (profiles AND post back-catalogues), local news, photos and video. Self / authorized / brand / consenting subjects only.
 ---
 
 # intel
@@ -91,29 +91,60 @@ Keyless pivots (each is a separate subcommand, JSON out):
   shadow direction/length for a place and UTC time; with a measured shadow bearing it
   returns the UTC time bands that day. Offline (NOAA formula, ~0.5 deg).
 
-Explicit LinkedIn (paid Apify, cookieless, your login never used, ~$0.004/lookup):
-- `intel linkedin <profile-or-company-url>` - full profile or company page. **Checks corpus
-  first**: if corpus holds a full profile synced in the last 90 days it returns that for $0
-  (`# source: corpus (stored, $0), as of <date>`). A posts-only author stub or an older
-  copy falls through to Apify, and the header says why (`corpus: stub only|stale|
-  not_tracked|unavailable`). `--fresh` forces a paid re-fetch. Quote the `as of` date.
+Explicit LinkedIn (paid, cookieless, your login never used, $0.004/lookup):
+- `intel linkedin <profile-or-company-url>` - profile or company page. Order: **corpus**
+  ($0, if it holds a full profile synced in the last 90 days) -> **HarvestAPI** direct
+  ($0.004, `main=true` short profile / company page, measured) -> **Apify** actor (only
+  when HarvestAPI is down, out of credit or unkeyed). The header names the vendor and
+  cost (`# source: harvestapi (paid, $0.004), as of <date>, corpus: stub only|stale|
+  not_tracked|unavailable`); `--json` adds `vendor` and `cost_usd`. A target HarvestAPI
+  says is missing is NOT retried on Apify. `--fresh` skips corpus. Quote the `as of` date.
 - `intel linkedin-search "title location keywords"` - people search ($0.10/page, deliberate).
-`--deep` also auto-enriches any LinkedIn URL a username scan surfaces (same corpus-first rule).
-Every actor run carries an Apify-enforced spend cap (`maxTotalChargeUsd`: $0.05 profile,
+`--deep` also auto-enriches any LinkedIn URL a username scan surfaces (same order).
+Every Apify actor run carries an Apify-enforced spend cap (`maxTotalChargeUsd`: $0.05 profile,
 $0.50 search). An Apify error prints as `{"error": "apify 402/403 ..."}`, never as "no
 results". 403 "Too many outstanding invoices" = billing, not the actor.
-Tool: `intel.py`. Apify token: `~/.config/intel/apify_token`, else
-`APIFY_TOKEN` in `~/.reach/keys.env` (the one corpus and reach use).
+Tool: `intel.py`. Keys: `HARVESTAPI_KEY` (env or `~/.reach/keys.env`); Apify token
+`~/.config/intel/apify_token`, else `APIFY_TOKEN` in `~/.reach/keys.env`.
+
+## Which tool and vendor for what
+
+| Question | Use |
+|---|---|
+| Who is this person / company? | `intel` (`intel linkedin <url>` for one LinkedIn profile) |
+| What does an account publish, what works, how does it compare? | corpus via `intel content ...` (stored, reusable, audited) |
+| A quick one-off look: a page, a few recent posts, a transcript | `reach` |
+
+| Platform | Preferred vendor, cost | Fallback | Commands |
+|---|---|---|---|
+| LinkedIn profile / company | corpus ($0), then HarvestAPI $0.004 per lookup | Apify actor | `intel linkedin`, `reach linkedin` |
+| LinkedIn posts | HarvestAPI, $0.004 per page of ~100 | Apify actor, Bright Data (~10 newest) | `intel content sync`, `reach linkedin posts` |
+| Instagram posts | ScrapeCreators, 1 credit (~$0.002) per 12 posts | Apify actor, Bright Data | `intel content sync`, `reach instagram` |
+| TikTok videos | ScrapeCreators, 1 credit per 10 | none | `intel content sync`, `reach tiktok` |
+| Facebook page posts | ScrapeCreators, 1 credit per 3 | none | `intel content sync`, `reach facebook-page` |
+| YouTube Shorts / videos | yt-dlp, free | | `intel content sync`, `reach yt` |
+| Google Maps reviews | Bright Data, 1 credit per record (5k free/month), ~10 min | none | `reach reviews` (experimental: first live run returned only an error record) |
+
+**Balances:** `reach doctor` shows HarvestAPI dollars, ScrapeCreators credits, the Apify
+plan/cap and whether Bright Data accepts jobs (free reads); `intel content health` checks
+the corpus pipeline; `intel content adapters` lists corpus routes and their cost per 1k.
+Check before a large job and whenever results look empty.
+
+**Every result states its source and cost.** `intel` prints `# source: <vendor> (paid,
+$X), as of <date>`; `reach` prints `reach: served by <vendor>` and what it charged on
+stderr; `intel content sync --dry-run` prices a sync before spending. Put vendor, cost and
+as-of date next to every finding in a brief.
 
 ## CONTENT mode: `intel content ...` -> corpus (post back-catalogues + audits)
 
 `intel` answers WHO someone is. `corpus` (a separate tool, not in this repo) downloads
-WHAT an account has published: every LinkedIn/Instagram post or YouTube Short with metrics, media,
+WHAT an account has published: every LinkedIn, Instagram, TikTok or Facebook-page post or YouTube Short with metrics, media,
 transcripts and comments, into SQLite, then runs audit lenses and renders a client brief.
 It keeps its data in `~/.corpus/` on the machine it runs on. `intel content <args>` passes
 straight through to it, locally or over ssh (`$INTEL_CORPUS_CMD` or
-`~/.config/intel/corpus_cmd`, e.g. `ssh mac /path/to/corpus/.venv/bin/corpus`). Same Apify token, same actors as
-`intel linkedin`, so a stored profile and a fresh one are the same JSON.
+`~/.config/intel/corpus_cmd`, e.g. `ssh mac /path/to/corpus/.venv/bin/corpus`). It routes each platform
+through the vendors in the table above (HarvestAPI, the same scrapers `intel linkedin`
+uses, so a stored profile and a fresh one are the same JSON).
 
 ```
 intel content find "Name" --location Rijeka --company X  # candidates to CONFIRM, never an answer
@@ -124,7 +155,14 @@ intel content comments --dry-run  # comment text is priced per comment
 intel content analyze content-audit --execute   # dry-run without --execute
 intel content brief <handle>      # one HTML file in ~/Downloads (where corpus runs)
 intel content compare <client> <rival> <rival>   # side-by-side benchmark + rivals' best posts
+intel content compare --client <ref> <rival> ... [--days 90] [--lang hr] [--pdf]  # every platform of a client
 intel content outliers [--days 14] [--all]       # competitor posts at 3x+ their usual (free)
+intel content outliers <handle> [--x 3] [--min 50] [--json]
+intel content analyze account-summary --account <handle> [--lang hr] --execute
+                                  # one-page read: where it stands, 3 priorities, 4-week plan
+intel content brief <handle> --lang hr [--days 365] [--csv]   # Croatian brief text
+intel content weekly [--client-ref <ref>] [--send]  # what changed this week, WhatsApp-short
+intel content retention [--months 12] [--execute]   # GDPR: age out third-party comments (dry run default)
 intel content search "cold outreach" | profile <handle> --json | health | adapters
 intel content dashboard           # 127.0.0.1:8891 where corpus runs; tunnel it over ssh -L
 ```
@@ -171,9 +209,9 @@ cannot be backfilled; comments are capped at 25/post, one level.
    it. Employer -> `intel linkedin-search`. Phone -> `intel phone <number>` (phoneinfoga is unmaintained; see the phone section). Local
    angle -> `intel localnews`. Legal angle -> `intel court`.
 4. **Fetch content** with a tool you already have (route by platform):
-   IG -> `reach` (Apify) / `instaloader` / `agent-reach`. X -> `agent-reach`. Reddit ->
-   `reach`. YouTube -> `reach` (transcripts). LinkedIn -> `intel linkedin`. TikTok/FB ->
-   `agent-reach`. Blog/site -> `firecrawl`/`reach web`. Login-walled -> `browser-use`.
+   IG -> `reach instagram` (ScrapeCreators). TikTok -> `reach tiktok`. FB page ->
+   `reach facebook-page`. X -> `agent-reach`. Reddit -> `reach`. YouTube -> `reach`
+   (transcripts). LinkedIn -> `intel linkedin`. FB search/profiles -> `agent-reach`. Blog/site -> `firecrawl`/`reach web`. Login-walled -> `browser-use`.
    Cookie fetchers = BURNER accounts only.
 5. **Normalize** every pull to one schema (JSONL in scratchpad):
    `{platform, account_url, post_id, timestamp, text, media_type, likes, comments, shares, url}`.
@@ -599,7 +637,7 @@ castrickclues (domain gone).
 Fetchers: `reach` (Exa/Jina/Firecrawl/search/IG/Reddit/YouTube; Jina, Firecrawl and the
 Apify-backed Reddit route can run out of credits, so check `reach doctor` when results
 look empty), `agent-reach` (cookie social), `browser-use`, `browse` (headless Chrome, has
-`pdf`). PDF: `make-pdf`/`pdf` skills. Paid-per-run: Apify actors via `intel linkedin*` and content mode (corpus).
+`pdf`). PDF: `make-pdf`/`pdf` skills. Paid-per-run: HarvestAPI (then Apify) via `intel linkedin`, Apify via `intel linkedin-search`, and content mode (corpus); see "Which tool and vendor for what".
 
 **Manual-only services (use in the browser, never wire):** Epieos free tier (30/mo),
 Predicta Search free tier (check that any image search is not face matching first),

@@ -103,19 +103,23 @@ def checks():
     yield check("Hudson Rock: keyless endpoint answers",
                 lambda: intel._hudsonrock("email", "test@example.com"),
                 lambda r: r is not None and r.get("user_services") is not None)
-    # A real paid run (~$0.004/week). The doctor line below only reads the monthly
-    # cap, and passed on 2026-10-22 while every actor run was refused with 403
-    # "Too many outstanding invoices". This also catches the actor's input schema
-    # drifting, which shows up as an empty dataset rather than an error.
-    yield check("Apify: LinkedIn profile actor actually runs",
-                lambda: intel.linkedin("https://www.linkedin.com/in/williamhgates/",
-                                       fresh=True)["data"],
-                lambda d: isinstance(d, list) and d and d[0].get("lastName") == "Gates")
+    # A real paid lookup ($0.004/run, measured 2026-10-23) through the route intel
+    # actually uses first: HarvestAPI direct. It must be HarvestAPI that answered, not
+    # a silent Apify fallback, or a dead HarvestAPI key would hide behind Apify (and
+    # Apify was refusing every run with 403 "Too many outstanding invoices" on
+    # 2026-10-22 while its doctor line still passed). An empty element also catches
+    # the endpoint's shape drifting.
+    yield check("HarvestAPI: LinkedIn profile lookup answers",
+                lambda: (lambda r: (r.get("vendor"), r.get("data")))(intel.linkedin(
+                    "https://www.linkedin.com/in/williamhgates/", fresh=True)),
+                lambda vd: vd[0] == "harvestapi" and isinstance(vd[1], list) and vd[1]
+                and vd[1][0].get("lastName") == "Gates")
     yield check("reach doctor: no paid backend out of credit",
                 lambda: [re.sub(r"\x1b\[[0-9;]*m", "", ln).strip() for ln in subprocess.run(
                     ["reach", "doctor"], capture_output=True, text=True, timeout=120
                 ).stdout.splitlines() if "✗" in ln and any(
-                    k in ln for k in ("exa", "apify", "jina (", "web (jina)"))],
+                    k in ln for k in ("exa", "apify", "harvestapi", "scrapecreators",
+                                    "jina (", "web (jina)"))],
                 lambda bad: not bad)
 
 

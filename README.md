@@ -112,9 +112,11 @@ git clone https://github.com/simonseifert/osint-intel
 ln -s "$PWD/osint-intel/intel.py" ~/.local/bin/intel   # put it on PATH
 ```
 
-**Optional paid tier** (cookieless LinkedIn via Apify): set `INTEL_APIFY_TOKEN`, or drop the
-token in `~/.config/intel/apify_token` (chmod 600). Every run carries an Apify-enforced spend
-cap. Everything else is free and keyless.
+**Optional paid tier** (cookieless LinkedIn): set `HARVESTAPI_KEY` ([harvestapi.io](https://harvestapi.io),
+$0.004 per profile or company lookup, the price comes back with every response). Apify is the
+fallback: set `INTEL_APIFY_TOKEN`, or drop the token in `~/.config/intel/apify_token` (chmod
+600); every Apify run carries an Apify-enforced spend cap. Each result names the vendor that
+answered and its cost. Everything else is free and keyless.
 
 **Optional content mode**: if you also run a `corpus`-style back-catalogue tool (a CLI that
 stores an account's posts and answers `corpus profile <url> --json`), point

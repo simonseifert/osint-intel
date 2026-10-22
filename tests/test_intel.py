@@ -7,6 +7,7 @@ Real-site drift is caught by the live canary, `tests/canary.py`.
     python3 -m unittest discover -s tests -v
 """
 import importlib.util
+import io
 import json
 import os
 import unittest
@@ -300,16 +301,23 @@ class Output(unittest.TestCase):
 
 
 class CorpusBridge(unittest.TestCase):
-    """intel reads what corpus already paid for, and only falls back to Apify when
-    corpus cannot answer. Every branch here would otherwise cost money to test."""
+    """intel reads what corpus already paid for, then HarvestAPI direct, and only
+    falls back to Apify when HarvestAPI cannot answer. Every branch here would
+    otherwise cost money to test."""
+
+    HV_OK = {"cost": 0.004, "payments": ["linkedinProfileShort"], "element": {"paid": "hv"}}
 
     def setUp(self):
-        self._prof, self._actor = intel.corpus_profile, intel.run_actor
-        self.actor_calls = []
-        intel.run_actor = lambda *a, **k: self.actor_calls.append(a) or [{"paid": True}]
+        self._prof, self._actor, self._hv = intel.corpus_profile, intel.run_actor, intel.harvestapi
+        self.actor_calls, self.hv_calls = [], []
+        self.hv_reply = dict(self.HV_OK)
+        intel.run_actor = lambda *a, **k: self.actor_calls.append(a) or [{"paid": "apify"}]
+        intel.harvestapi = lambda path, params, **k: (self.hv_calls.append((path, params))
+                                                      or self.hv_reply)
+        intel.corpus_profile = lambda t: {"status": "not_tracked"}
 
     def tearDown(self):
-        intel.corpus_profile, intel.run_actor = self._prof, self._actor
+        intel.corpus_profile, intel.run_actor, intel.harvestapi = self._prof, self._actor, self._hv
 
     def stored(self, **over):
         d = {"status": "found", "complete": True, "relationship": "own",
@@ -322,28 +330,124 @@ class CorpusBridge(unittest.TestCase):
         out = intel.linkedin("https://www.linkedin.com/in/someone/")
         self.assertEqual(out["data"], [{"firstName": "A"}])
         self.assertTrue(out["source"].startswith("corpus"))
-        self.assertEqual(self.actor_calls, [])
+        self.assertEqual((out["vendor"], out["cost_usd"]), ("corpus", 0.0))
+        self.assertEqual((self.hv_calls, self.actor_calls), ([], []))
 
     def test_author_stub_is_not_a_profile(self):
         self.stored(complete=False)
         out = intel.linkedin("https://www.linkedin.com/in/someone/")
         self.assertEqual(out["corpus"], "stub only")
-        self.assertEqual(len(self.actor_calls), 1)
+        self.assertEqual((len(self.hv_calls), self.actor_calls), (1, []))
 
     def test_stale_profile_is_refetched(self):
         self.stored(last_scraped_at=intel.time.time() - 200 * 86400)
         self.assertEqual(intel.linkedin("https://www.linkedin.com/in/x/")["corpus"], "stale")
-        self.assertEqual(len(self.actor_calls), 1)
+        self.assertEqual(len(self.hv_calls), 1)
 
     def test_fresh_flag_skips_corpus(self):
         self.stored()
         out = intel.linkedin("https://www.linkedin.com/in/x/", fresh=True)
-        self.assertEqual(out["data"], [{"paid": True}])
+        self.assertEqual(out["data"], [{"paid": "hv"}])
 
-    def test_company_url_uses_the_company_actor(self):
-        intel.corpus_profile = lambda t: {"status": "not_tracked"}
+    def test_harvestapi_answers_first_and_states_its_cost(self):
+        out = intel.linkedin("https://www.linkedin.com/in/x/")
+        self.assertEqual(self.hv_calls[0], ("/linkedin/profile",
+                                            {"query": "https://www.linkedin.com/in/x/",
+                                             "main": "true"}))
+        self.assertEqual((out["vendor"], out["cost_usd"]), ("harvestapi", 0.004))
+        self.assertIn("$0.004", out["source"])
+        self.assertEqual(self.actor_calls, [])
+        for k in ("module", "source", "as_of", "data"):
+            self.assertIn(k, out)
+
+    def test_company_url_uses_the_company_endpoint(self):
         intel.linkedin("https://www.linkedin.com/company/acme/")
+        self.assertEqual(self.hv_calls[0][0], "/linkedin/company")
+
+    def test_harvestapi_down_falls_back_to_apify(self):
+        self.hv_reply = {"error": "harvestapi 402: out of credit", "fallback": True}
+        out = intel.linkedin("https://www.linkedin.com/company/acme/")
         self.assertEqual(self.actor_calls[0][0], "harvestapi/linkedin-company")
+        self.assertEqual((out["vendor"], out["data"]), ("apify", [{"paid": "apify"}]))
+        self.assertIn("402", out["harvestapi"])
+
+    def test_target_not_found_does_not_pay_apify_too(self):
+        self.hv_reply = {"error": "harvestapi 404: not found", "fallback": False}
+        out = intel.linkedin("https://www.linkedin.com/in/nobody-here/")
+        self.assertEqual(self.actor_calls, [])
+        self.assertIn("error", out["data"])
+
+
+class HarvestApiHttp(unittest.TestCase):
+    """The HTTP layer itself, with urlopen stubbed: the key travels in a header (never
+    the URL), and each failure says whether another vendor is worth paying."""
+
+    class _Resp(io.BytesIO):
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+    def setUp(self):
+        self._open, self.seen = intel.urllib.request.urlopen, []
+        self._key = os.environ.get("HARVESTAPI_KEY")
+        os.environ["HARVESTAPI_KEY"] = "test-key"
+
+    def tearDown(self):
+        intel.urllib.request.urlopen = self._open
+        if self._key is None:
+            os.environ.pop("HARVESTAPI_KEY", None)
+        else:
+            os.environ["HARVESTAPI_KEY"] = self._key
+
+    def reply(self, body=None, code=None):
+        def fake(req, timeout=None):
+            self.seen.append(req)
+            if code:
+                raise intel.urllib.error.HTTPError(req.full_url, code, "x", {},
+                                                   io.BytesIO(json.dumps(body).encode()))
+            return self._Resp(json.dumps(body).encode())
+        intel.urllib.request.urlopen = fake
+
+    def test_ok_and_key_in_header_only(self):
+        self.reply({"cost": 0.004, "error": None, "element": {"name": "Acme"}})
+        d = intel.harvestapi("/linkedin/company", {"query": "https://x/company/acme/"})
+        self.assertEqual(d["element"], {"name": "Acme"})
+        req = self.seen[0]
+        self.assertEqual(req.get_header("X-api-key"), "test-key")
+        self.assertNotIn("test-key", req.full_url)
+
+    def test_bad_key_falls_back(self):
+        self.reply({"status": 401, "error": {"error": "Invalid API key"}}, code=401)
+        d = intel.harvestapi("/linkedin/profile", {"query": "x"})
+        self.assertTrue(d["fallback"])
+        self.assertIn("401", d["error"])
+
+    def test_not_found_does_not_fall_back(self):
+        self.reply({"error": "not found"}, code=404)
+        self.assertFalse(intel.harvestapi("/linkedin/profile", {"query": "x"})["fallback"])
+
+    def test_error_in_200_body_is_not_success(self):
+        self.reply({"cost": 0, "error": "Profile not found", "element": None})
+        d = intel.harvestapi("/linkedin/profile", {"query": "x"})
+        self.assertIn("error", d)
+        self.assertFalse(d["fallback"])
+
+    def test_no_key_falls_back_without_a_request(self):
+        os.environ.pop("HARVESTAPI_KEY", None)
+        orig = intel._keys_env
+        intel._keys_env = lambda name: None
+        try:
+            self.assertTrue(intel.harvestapi("/linkedin/profile", {"query": "x"})["fallback"])
+        finally:
+            intel._keys_env = orig
+        self.assertEqual(self.seen, [])
+
+
+class CorpusArgv(unittest.TestCase):
+    def setUp(self):
+        self._prof = intel.corpus_profile
 
     def test_ssh_arguments_are_quoted_for_the_remote_shell(self):
         orig = os.environ.get("INTEL_CORPUS_CMD")
