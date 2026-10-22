@@ -1,6 +1,6 @@
 ---
 name: intel
-description: Unified OSINT and intelligence. Auto-detects the target (email, username/handle, phone number, domain, company, or a person described by clues) and runs the right modules, then fetches, ANALYZES (text, images, video), and assembles a visual BRIEF (with optional PDF export). Use for "osint X", "check my/this footprint" / "how exposed am I" (self-audit mode), "who is this GitHub/Discord account", "who is this username/email", "who is behind this phone number / who called me / is this number spam", "look up this company/domain", "find the person who <clues>" (akinator), "analyze this brand's socials", "is this email breached", "dig into <company>", "build a brief/dossier on X". Also the front door to `corpus` (content mode): "download/pull someone's LinkedIn or Instagram posts", "content audit of X", "what is working for <competitor/creator>", "brief on my/client's content", "track this profile". Covers people, businesses, brands, domains, breaches, LinkedIn (profiles AND post back-catalogues), local news, photos and video. Self / authorized / brand / consenting subjects only.
+description: Unified OSINT and intelligence. Auto-detects the target (email, username/handle, phone number, domain, company, or a person described by clues) and runs the right modules, then fetches, ANALYZES (text, images, video), and assembles a visual BRIEF (with optional PDF export). Use for "osint X", "check my/this footprint" / "how exposed am I" (self-audit mode), "who is this GitHub/Discord account", "who is this username/email", "who is behind this phone number / who called me / is this number spam", "look up this company/domain", "find the person who <clues>" (akinator), "analyze this brand's socials", "is this email breached", "dig into <company>", "build a brief/dossier on X". Also the front door to `corpus` (content mode): "download/pull someone's LinkedIn, Instagram or YouTube Shorts", "content audit of X", "what is working for <competitor/creator>", "compare my client with competitors", "which competitor posts are blowing up", "brief on my/client's content", "track this profile". Covers people, businesses, brands, domains, breaches, LinkedIn (profiles AND post back-catalogues), local news, photos and video. Self / authorized / brand / consenting subjects only.
 ---
 
 # intel
@@ -108,7 +108,7 @@ Tool: `intel.py`. Apify token: `~/.config/intel/apify_token`, else
 ## CONTENT mode: `intel content ...` -> corpus (post back-catalogues + audits)
 
 `intel` answers WHO someone is. `corpus` (a separate tool, not in this repo) downloads
-WHAT an account has published: every LinkedIn/Instagram post with metrics, media,
+WHAT an account has published: every LinkedIn/Instagram post or YouTube Short with metrics, media,
 transcripts and comments, into SQLite, then runs audit lenses and renders a client brief.
 It keeps its data in `~/.corpus/` on the machine it runs on. `intel content <args>` passes
 straight through to it, locally or over ssh (`$INTEL_CORPUS_CMD` or
@@ -123,6 +123,8 @@ intel content enrich              # transcripts + keyframes
 intel content comments --dry-run  # comment text is priced per comment
 intel content analyze content-audit --execute   # dry-run without --execute
 intel content brief <handle>      # one HTML file in ~/Downloads (where corpus runs)
+intel content compare <client> <rival> <rival>   # side-by-side benchmark + rivals' best posts
+intel content outliers [--days 14] [--all]       # competitor posts at 3x+ their usual (free)
 intel content search "cold outreach" | profile <handle> --json | health | adapters
 intel content dashboard           # 127.0.0.1:8891 where corpus runs; tunnel it over ssh -L
 ```
