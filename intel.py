@@ -54,6 +54,7 @@ import io
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -1607,11 +1608,25 @@ def _debug(msg):
         print(f"# {msg}", file=sys.stderr)
 
 
-def social_from_url(url):
-    """(platform, handle) for a profile URL on a known social host, else None."""
+_WWW_HOSTS = {"linkedin.com", "instagram.com", "youtube.com", "tiktok.com", "facebook.com"}
+_HANDLE_OK = re.compile(r"[A-Za-z0-9._-]{1,100}")
+
+
+def social_profile(url):
+    """(platform, handle, canonical_url) for a profile URL on a known social host,
+    else None. The canonical URL is rebuilt from the matched host and path, never
+    passed through: these URLs come from scraped pages and get printed as a shell
+    command, so userinfo, ports, odd schemes, backslashes and any handle outside
+    [A-Za-z0-9._-] are refused rather than escaped."""
+    url = (url or "").strip()
+    if "\\" in url or any(c.isspace() for c in url):
+        return None
     try:
         u = urllib.parse.urlsplit(url if "//" in url else "https://" + url)
+        port = u.port
     except ValueError:
+        return None
+    if u.scheme not in ("http", "https") or "@" in u.netloc or port is not None:
         return None
     host = (u.hostname or "").lower().removeprefix("www.").removeprefix("m.")
     for dom, platform, pat in _SOCIAL_HOSTS:
@@ -1619,11 +1634,18 @@ def social_from_url(url):
             m = re.match(pat, u.path or "")
             if not m:
                 return None
-            h = urllib.parse.unquote(m.group(1)).rstrip("/")
-            if not h or h.lower() in _SOCIAL_RESERVED:
+            h = m.group(1).rstrip("/")
+            if not _HANDLE_OK.fullmatch(h) or h.lower() in _SOCIAL_RESERVED:
                 return None
-            return platform, h.lower()
+            www = "www." if dom in _WWW_HOSTS else ""
+            return platform, h.lower(), f"https://{www}{dom}{u.path[:m.start(1)]}{h}"
     return None
+
+
+def social_from_url(url):
+    """(platform, handle) for a profile URL on a known social host, else None."""
+    sp = social_profile(url)
+    return sp[:2] if sp else None
 
 
 def corpus_lookup(queries, timeout=CORPUS_LOOKUP_TIMEOUT):
@@ -1674,10 +1696,19 @@ def sanitize_corpus_match(m):
                               for f in m.get("top_formats") or [] if isinstance(f, dict)]
         out["handling"] = ("private own/client data: aggregate numbers only. Do not send "
                            "it to any cloud LLM or external service")
-    for k, v in list(out.items()):
-        if isinstance(v, str):
-            out[k] = _clean(v)
-    return out
+    return _clean_deep(out)
+
+
+def _clean_deep(v):
+    """_clean on every string at any depth: nested top_posts/outliers carry
+    scraped text (opening lines, URLs) that reaches the terminal."""
+    if isinstance(v, str):
+        return _clean(v)
+    if isinstance(v, dict):
+        return {k: _clean_deep(x) for k, x in v.items()}
+    if isinstance(v, list):
+        return [_clean_deep(x) for x in v]
+    return v
 
 
 def corpus_candidates(kind, value, modules):
@@ -1709,11 +1740,11 @@ def collect_socials(modules):
     out, seen = [], set()
 
     def add(url, source):
-        sh = social_from_url(url or "")
-        if not sh or sh in seen:
+        sp = social_profile(url or "")
+        if not sp or sp[:2] in seen:
             return
-        seen.add(sh)
-        out.append({"platform": sh[0], "handle": sh[1], "url": _clean(url), "source": source})
+        seen.add(sp[:2])
+        out.append({"platform": sp[0], "handle": sp[1], "url": sp[2], "source": source})
 
     for m in modules:
         if not isinstance(m, dict):
@@ -1753,7 +1784,7 @@ def corpus_section(kind, value, modules):
     suggestions = []
     for s in collect_socials(modules):
         if s["platform"] in CORPUS_PLATFORMS and (s["platform"], s["handle"]) not in tracked:
-            suggestions.append({**s, "command": f"intel content add {s['url']} "
+            suggestions.append({**s, "command": f"intel content add {shlex.quote(s['url'])} "
                                 f"--relationship <own|client|competitor|influencer>"})
     if not matches and not suggestions:
         return None

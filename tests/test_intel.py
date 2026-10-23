@@ -543,7 +543,7 @@ class CorpusWorkingTogether(unittest.TestCase):
         self.assertEqual([(s["platform"], s["handle"]) for s in sug],
                          [("linkedin", "acme-founder")])
         self.assertTrue(sug[0]["command"].startswith(
-            "intel content add https://www.linkedin.com/in/acme-founder/ --relationship"))
+            "intel content add https://www.linkedin.com/in/acme-founder --relationship"))
 
     def test_private_entries_are_rebuilt_from_aggregates_only(self):
         self.reply([self.PRIV])
@@ -647,6 +647,39 @@ class CorpusWorkingTogether(unittest.TestCase):
         self.assertEqual(f("https://www.tiktok.com/@acme.tok"), ("tiktok", "acme.tok"))
         self.assertIsNone(f("https://www.instagram.com/p/xyz/"))
         self.assertIsNone(f("https://acme.example/in/x"))
+
+    def test_social_profile_refuses_hostile_urls_and_canonicalises(self):
+        f = intel.social_profile
+        self.assertEqual(f("https://m.instagram.com/acme.studio/?hl=en"),
+                         ("instagram", "acme.studio", "https://www.instagram.com/acme.studio"))
+        for bad in ("https://instagram.com/x;rm -rf ~",
+                    "https://instagram.com/$(touch%20pwned)",
+                    "https://instagram.com/a%27b",
+                    "https://evil@instagram.com/acme",
+                    "https://instagram.com:8443/acme",
+                    "javascript://instagram.com/acme",
+                    "https://instagram.com\\@evil.example/acme",
+                    "https://instagram.com/acme\x1b[31m"):
+            self.assertIsNone(f(bad), bad)
+
+    def test_suggested_command_is_shell_quoted_and_canonical(self):
+        orig = intel.corpus_lookup
+        intel.corpus_lookup = lambda c, **k: {"status": "ok", "matches": []}
+        try:
+            mods = [{"module": "username", "accounts": [
+                {"url": "https://www.tiktok.com/@acme.tok?lang=en"}]}]
+            sec = intel.corpus_section("username", "acme", mods)
+        finally:
+            intel.corpus_lookup = orig
+        cmd = sec["suggestions"][0]["command"]
+        self.assertTrue(cmd.startswith("intel content add https://www.tiktok.com/@acme.tok "), cmd)
+
+    def test_nested_corpus_strings_are_cleaned(self):
+        m = intel.sanitize_corpus_match({
+            "private": False, "relationship": "competitor", "platform": "instagram",
+            "handle": "acme", "top_posts": [{"date": "2026-01-01", "engagement": 5,
+                                             "url": "https://x.example/p", "opening": "hi\x1b[2Jthere"}]})
+        self.assertNotIn("\x1b", json.dumps(m["top_posts"]))
 
 
 if __name__ == "__main__":
