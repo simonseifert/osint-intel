@@ -34,7 +34,12 @@ Content back-catalogue (passes through to the separate `corpus` tool):
     intel content add <url> --relationship own|client|competitor|influencer
     intel content sync|comments|analyze|brief|find|search|profile|health ...
 
-Flags: --json  --deep (paid enrichment of found LinkedIn URLs)  --region=XX (phone).
+Working with corpus (optional): person/company/username/domain runs add a "Content
+(tracked in corpus)" section when corpus already tracks the subject (read-only, free;
+own/client accounts are aggregate-only). Untracked profiles are listed with the command
+to track them; nothing is auto-tracked. `intel socials <target> --json` lists the
+profiles the keyless modules found: [{platform, handle, url, source}].
+Flags: --json  --no-corpus  --verbose  --deep (paid enrichment of found LinkedIn URLs)  --region=XX (phone).
 Keyless by default. HARVESTAPI_KEY from the env or ~/.reach/keys.env; Apify token from
 ~/.config/intel/apify_token, $INTEL_APIFY_TOKEN or APIFY_TOKEN in ~/.reach/keys.env.
 corpus via $INTEL_CORPUS_CMD / ~/.config/intel/corpus_cmd.
@@ -1548,6 +1553,224 @@ def corpus_passthrough(args):
     return subprocess.call(argv)
 
 
+# ---------------- corpus <-> intel: tracked content, and social profiles ----------------
+#
+# Two directions, both cheap and both optional:
+#   corpus_lookup()  asks `corpus lookup ... --json` (read-only, free) whether the
+#                    handles / domain / name a run found are already tracked, and adds
+#                    a "Content (tracked in corpus)" section to the result.
+#   socials()        lists the social profiles the existing modules found, so corpus's
+#                    `find --via-intel` can offer them for tracking.
+# A missing, unreachable or slow corpus is skipped with one line under --verbose (or
+# INTEL_DEBUG=1) and never fails the run. Nothing here ever tracks anything: that
+# spends money, so it is only ever printed as a command for the user to run.
+#
+# PRIVACY. corpus marks own/client accounts "private": true and then returns only
+# aggregates. intel never asks for private detail (no --include-private) and,
+# belt and braces, rebuilds every private entry from an allow-list of aggregate
+# fields, so a corpus that ignored the rule still cannot push client text into a
+# brief. intel runs no LLM itself; the brief is read by whatever model drives it, so
+# that rebuilt entry is the most any such model ever gets.
+
+CORPUS_LOOKUP_TIMEOUT = 10
+MAX_LOOKUP_CANDIDATES = 12
+_VERBOSE = False
+
+# The platforms corpus can track (corpus/discover.py PLATFORM_PATTERNS).
+CORPUS_PLATFORMS = ("linkedin", "instagram", "youtube", "tiktok", "facebook")
+_PUBLIC_RELATIONSHIPS = ("competitor", "influencer")
+_PRIVATE_KEEP = ("private", "platform", "handle", "url", "relationship", "followers",
+                 "posts_stored", "first_post", "last_post", "last_synced",
+                 "cadence_median_days", "engagement_median", "brief_cmd")
+_PUBLIC_KEEP = _PRIVATE_KEEP + ("display_name", "top_posts", "recent_outliers",
+                                "top_formats", "top_topics", "summary")
+
+_SOCIAL_HOSTS = (
+    ("linkedin.com", "linkedin", r"/(?:in|company|school)/([^/?#]+)"),
+    ("instagram.com", "instagram", r"/(?!p/|reel/|reels/|stories/|explore/)([^/?#]+)"),
+    ("youtube.com", "youtube", r"/@([^/?#]+)"),
+    ("tiktok.com", "tiktok", r"/@([^/?#]+)"),
+    ("facebook.com", "facebook", r"/(?!profile\.php|groups/|share|watch|reel|events/|pages/|people/)([^/?#]{2,})"),
+    ("twitter.com", "x", r"/([^/?#]+)"),
+    ("x.com", "x", r"/([^/?#]+)"),
+    ("github.com", "github", r"/([^/?#]+)"),
+    ("threads.net", "threads", r"/@([^/?#]+)"),
+    ("t.me", "telegram", r"/([^/?#]+)"),
+    ("mastodon.social", "mastodon", r"/@([^/?#]+)"),
+)
+_SOCIAL_RESERVED = {"about", "legal", "privacy", "accounts", "explore", "login", "help",
+                    "share", "intent", "home", "i", "settings", "company", "p", "reel"}
+
+
+def _debug(msg):
+    if _VERBOSE or os.environ.get("INTEL_DEBUG"):
+        print(f"# {msg}", file=sys.stderr)
+
+
+def social_from_url(url):
+    """(platform, handle) for a profile URL on a known social host, else None."""
+    try:
+        u = urllib.parse.urlsplit(url if "//" in url else "https://" + url)
+    except ValueError:
+        return None
+    host = (u.hostname or "").lower().removeprefix("www.").removeprefix("m.")
+    for dom, platform, pat in _SOCIAL_HOSTS:
+        if host == dom or host.endswith("." + dom):
+            m = re.match(pat, u.path or "")
+            if not m:
+                return None
+            h = urllib.parse.unquote(m.group(1)).rstrip("/")
+            if not h or h.lower() in _SOCIAL_RESERVED:
+                return None
+            return platform, h.lower()
+    return None
+
+
+def corpus_lookup(queries, timeout=CORPUS_LOOKUP_TIMEOUT):
+    """{"status": "ok", "matches": [...]} or {"status": "unavailable", "why": ...}.
+    Never raises, never prompts, never asks for private detail."""
+    queries = [q for q in dict.fromkeys(str(q).strip() for q in queries) if q][:MAX_LOOKUP_CANDIDATES]
+    if not queries:
+        return {"status": "skipped", "why": "no candidates"}
+    if os.environ.get("INTEL_NO_CORPUS"):
+        return {"status": "skipped", "why": "INTEL_NO_CORPUS set"}
+    # "--" so a candidate that starts with "-" is data, not a corpus flag.
+    argv = _corpus_argv(["lookup", "--json", "--"] + queries)
+    if not argv:
+        return {"status": "unavailable", "why": "corpus not configured"}
+    try:
+        r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout,
+                           stdin=subprocess.DEVNULL)
+        d = json.loads(r.stdout.strip().splitlines()[-1])
+    except subprocess.TimeoutExpired:
+        return {"status": "unavailable", "why": f"timed out after {timeout}s"}
+    except (OSError, ValueError, IndexError) as e:
+        return {"status": "unavailable", "why": type(e).__name__}
+    if not isinstance(d, dict) or not isinstance(d.get("matches"), list):
+        return {"status": "unavailable", "why": d.get("error", "unexpected reply")
+                if isinstance(d, dict) else "unexpected reply"}
+    return {"status": "ok", "matches": d["matches"]}
+
+
+def _is_private(m):
+    """Fail closed: public only when corpus says so AND the relationship agrees."""
+    return not (m.get("private") is False and m.get("relationship") in _PUBLIC_RELATIONSHIPS)
+
+
+def sanitize_corpus_match(m):
+    """The entry as intel is willing to carry it. Private ones are rebuilt from
+    aggregate fields only; nothing textual survives."""
+    if not isinstance(m, dict):
+        return None
+    priv = _is_private(m)
+    out = {k: m[k] for k in (_PRIVATE_KEEP if priv else _PUBLIC_KEEP) if k in m}
+    out["private"] = priv
+    if priv:
+        out["top_posts"] = [{"date": p.get("date"), "engagement": p.get("engagement")}
+                            for p in m.get("top_posts") or [] if isinstance(p, dict)]
+        out["recent_outliers"] = [{k: p.get(k) for k in ("date", "engagement", "usual", "x")}
+                                  for p in m.get("recent_outliers") or [] if isinstance(p, dict)]
+        out["top_formats"] = [{k: f.get(k) for k in ("kind", "posts", "median_engagement")}
+                              for f in m.get("top_formats") or [] if isinstance(f, dict)]
+        out["handling"] = ("private own/client data: aggregate numbers only. Do not send "
+                           "it to any cloud LLM or external service")
+    for k, v in list(out.items()):
+        if isinstance(v, str):
+            out[k] = _clean(v)
+    return out
+
+
+def corpus_candidates(kind, value, modules):
+    """What to ask corpus about for this run: the handle, domain or name itself, plus
+    the profile URLs of socials the modules found (corpus matches URLs exactly)."""
+    c = []
+    if kind == "username":
+        c.append(value.lstrip("@"))
+    elif kind == "domain":
+        c.append(value)
+    elif kind in ("company", "person"):
+        c.append(value)
+        for m in modules:
+            for e in (m or {}).get("entities") or []:
+                if isinstance(e, dict) and e.get("name"):
+                    c.append(e["name"])
+            for h in ((m or {}).get("sudreg") or {}).get("matches") or []:
+                if isinstance(h, dict) and h.get("name"):
+                    c.append(h["name"])
+    for s in collect_socials(modules):
+        if s["platform"] in CORPUS_PLATFORMS:
+            c.append(s["url"])
+    return list(dict.fromkeys(x for x in c if x))[:MAX_LOOKUP_CANDIDATES]
+
+
+def collect_socials(modules):
+    """[{platform, handle, url, source}] from what the existing modules already found.
+    No lookups of its own. Weak maigret hits (search pages, site roots) are dropped."""
+    out, seen = [], set()
+
+    def add(url, source):
+        sh = social_from_url(url or "")
+        if not sh or sh in seen:
+            return
+        seen.add(sh)
+        out.append({"platform": sh[0], "handle": sh[1], "url": _clean(url), "source": source})
+
+    for m in modules:
+        if not isinstance(m, dict):
+            continue
+        mod = m.get("module")
+        if mod == "username":
+            for a in m.get("accounts") or []:
+                if isinstance(a, dict) and not a.get("weak"):
+                    add(a.get("url"), "maigret")
+        elif mod == "github":
+            for x in m.get("socials") or []:
+                add(x.get("url"), "github profile")
+            prof = m.get("profile") or {}
+            if prof.get("login"):
+                add(f"https://github.com/{prof['login']}", "github profile")
+            if prof.get("twitter_username"):
+                add(f"https://x.com/{prof['twitter_username']}", "github profile")
+            if prof.get("blog"):
+                add(prof["blog"], "github profile")
+        elif mod == "email":
+            for a in (m.get("gravatar") or {}).get("accounts") or []:
+                add(a.get("url"), "gravatar")
+    return out
+
+
+def corpus_section(kind, value, modules):
+    """The result's `content` block, or None when there is nothing to say."""
+    cands = corpus_candidates(kind, value, modules)
+    if not cands:
+        return None
+    got = corpus_lookup(cands)
+    if got["status"] != "ok":
+        _debug(f"corpus lookup skipped: {got.get('why')}")
+        return None
+    matches = [x for x in (sanitize_corpus_match(m) for m in got["matches"]) if x]
+    tracked = {(m.get("platform"), (m.get("handle") or "").lower()) for m in matches}
+    suggestions = []
+    for s in collect_socials(modules):
+        if s["platform"] in CORPUS_PLATFORMS and (s["platform"], s["handle"]) not in tracked:
+            suggestions.append({**s, "command": f"intel content add {s['url']} "
+                                f"--relationship <own|client|competitor|influencer>"})
+    if not matches and not suggestions:
+        return None
+    return {"source": "corpus lookup (read-only, free)", "candidates": cands,
+            "matches": matches, "suggestions": suggestions,
+            "note": "Matches by name or domain are leads, not identity: confirm the account "
+                    "is the same subject. Tracking costs money, so nothing is auto-added."}
+
+
+def socials(target):
+    """`intel socials <target> --json`: the social profiles the existing keyless
+    modules find for a handle / email / GitHub user / domain / company. A bare list of
+    {platform, handle, url, source}. Adds no lookup of its own and never pays."""
+    res = assemble(target, corpus=False)
+    return collect_socials(res["modules"])
+
+
 # ---------------- HarvestAPI (direct, paid per request) ----------------
 #
 # The company behind the harvestapi/* Apify actors also sells the same scrapers as a
@@ -1877,7 +2100,7 @@ def mod_github(user, max_repos=5):
 
 # ---------------- assemble + CLI ----------------
 
-def assemble(query, deep=False, region=None):
+def assemble(query, deep=False, region=None, corpus=True):
     t, value = classify(query)
     res = {"query": query, "detected": t, "modules": []}
     if value != query.strip():
@@ -1927,6 +2150,10 @@ def assemble(query, deep=False, region=None):
                 if isinstance(a, dict) and "linkedin.com/in/" in a.get("url", ""):
                     a["linkedin"] = linkedin(a["url"]).get("data")
     res["modules"] = [m for m in res["modules"] if m]
+    if corpus and t in ("username", "domain", "company", "person"):
+        content = corpus_section(t, query, res["modules"])
+        if content:
+            res["content"] = content
     # Evidence hygiene: every result says WHEN it was observed. Pages change and vanish;
     # a finding without a retrieval time cannot be re-checked or defended later.
     res["retrieved_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -1934,6 +2161,41 @@ def assemble(query, deep=False, region=None):
         if isinstance(m, dict):
             m.setdefault("retrieved_at", res["retrieved_at"])
     return res
+
+
+def _print_content(c):
+    print("\n[Content (tracked in corpus)]")
+    for m in c["matches"]:
+        tag = "  PRIVATE: aggregate only" if m["private"] else ""
+        print(f"  {m.get('platform')}:{m.get('handle')}  {m.get('relationship')}{tag}")
+        print(f"    {m.get('followers')} followers, {m.get('posts_stored')} posts stored "
+              f"({m.get('first_post')} .. {m.get('last_post')}), synced {m.get('last_synced')}; "
+              f"posts every {m.get('cadence_median_days')} days, median engagement "
+              f"{m.get('engagement_median')}")
+        if m.get("top_formats"):
+            print("    formats: " + ", ".join(f"{f.get('kind')} x{f.get('posts')}"
+                                              for f in m["top_formats"]))
+        for p in m.get("top_posts") or []:
+            print(f"    top: {p.get('date')} engagement {p.get('engagement')}"
+                  + (f"  {p['url']}  {p.get('opening') or ''}" if p.get("url") else ""))
+        for o in m.get("recent_outliers") or []:
+            print(f"    outlier: {o.get('date')} engagement {o.get('engagement')} "
+                  f"({o.get('x')}x usual)"
+                  + (f"  {o['url']}  {o.get('opening') or ''}" if o.get("url") else ""))
+        if m.get("top_topics"):
+            print("    topics: " + ", ".join(t["topic"] for t in m["top_topics"]))
+        if m.get("summary"):
+            print("    summary: " + m["summary"].strip().splitlines()[0][:200])
+        if m.get("handling"):
+            print("    ! " + m["handling"])
+        print(f"    more: intel content brief {m.get('platform')}:{m.get('handle')}")
+    if c["suggestions"]:
+        print("  Found by intel but NOT tracked yet (tracking costs money; run it yourself,"
+              " pick the relationship):")
+        for s_ in c["suggestions"]:
+            print(f"    {s_['platform']:10} {s_['url']}   [{s_['source']}]")
+            print(f"      {s_['command']}")
+    print("  " + c["note"])
 
 
 def _print(res):
@@ -2136,6 +2398,8 @@ def _print(res):
                       f"of {c.get('items')} items · {c.get('caution')}")
             for a in m["articles"][:15]:
                 print(f"    [{a.get('country', '?')}] {a.get('domain', '')}: {a.get('title', '')[:60]}")
+    if res.get("content"):
+        _print_content(res["content"])
 
 
 def main(argv=None):
@@ -2145,6 +2409,9 @@ def main(argv=None):
     # A national-format number needs a country to mean anything; the default is applied
     # (and flagged) in _phone_parse, never silently here.
     region = next((x.split("=", 1)[1] for x in argv if x.startswith("--region=")), None)
+    global _VERBOSE
+    _VERBOSE = "--verbose" in argv
+    no_corpus = "--no-corpus" in argv
     a = [x for x in argv if not x.startswith("--")]
     if not a:
         print(__doc__)
@@ -2154,6 +2421,10 @@ def main(argv=None):
         sys.exit(corpus_passthrough(argv[1:]))
     if a[0] == "embed" and len(a) > 1:
         print(embed(a[1]))
+        return
+    if a[0] == "socials" and len(a) > 1:
+        # A bare JSON list, whatever the flags: it is the machine contract corpus reads.
+        print(_clean(json.dumps(socials(" ".join(a[1:])), indent=2, ensure_ascii=False)))
         return
     if a[0] == "linkedin" and len(a) > 1:
         out = linkedin(a[1], fresh="--fresh" in argv)
@@ -2186,7 +2457,7 @@ def main(argv=None):
         out = {"query": q, "detected": "phone",
                "modules": [mod_phone(q, region=region, accounts="--accounts" in argv)]}
     else:
-        out = assemble(" ".join(a), deep=deep, region=region)
+        out = assemble(" ".join(a), deep=deep, region=region, corpus=not no_corpus)
     if as_json:
         # json escapes C0 controls itself, but not C1 or bidi overrides
         print(_clean(json.dumps(out, indent=2, ensure_ascii=False)))

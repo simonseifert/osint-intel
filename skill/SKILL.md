@@ -167,6 +167,33 @@ intel content search "cold outreach" | profile <handle> --json | health | adapte
 intel content dashboard           # 127.0.0.1:8891 where corpus runs; tunnel it over ssh -L
 ```
 
+### Working together: corpus <-> intel (both directions, free)
+
+- **Automatic lookup.** `intel <@handle | domain | company | person>` now asks
+  `corpus lookup <candidates> --json` (read-only, $0, 10s timeout, same `corpus_cmd` as
+  `intel content`) and adds a "Content (tracked in corpus)" section to the brief and under
+  `content` in `--json`: followers, cadence, formats, top posts, outliers, topics, summary.
+  Put that section in the brief (Analysis / Connections) with the `brief_cmd` as the next
+  step. A corpus that is down or slow is skipped silently (`--verbose` says why);
+  `--no-corpus` disables it. Name and domain matches are leads, not identity: confirm.
+  Run `corpus lookup <x>` directly (`intel content lookup <x>`) for a quick "do we track
+  this?".
+- **Suggestions, never auto-track.** Socials intel found that corpus does not track are
+  listed with `intel content add <url> --relationship ...`. Tracking and syncing spend
+  money: offer the command, ask which relationship, price it with `intel content sync
+  --dry-run`, and wait for the go-ahead.
+- **PRIVACY RULE.** Entries with `"private": true` (relationship own/client) are client
+  data and arrive as aggregate numbers only. Never pass `--include-private` from this skill,
+  never paste a private entry (or anything from `intel content brief|show` of an own/client
+  account) into a web search, Exa/Firecrawl query, third-party LLM tool or a cloud-model
+  subagent beyond this conversation, and keep it out of anything shareable unless the user
+  asks. intel runs no LLM of its own: the model reading the output is the only cloud step,
+  and the CLI already strips private entries to aggregates before it gets there.
+- **Other direction.** `intel socials <target> --json` -> `[{platform, handle, url, source}]`
+  from the existing keyless modules (handle search, GitHub, Gravatar); it is what
+  `corpus find <target> --via-intel` shells out to for "where else is this entity?"
+  (suggestions only; company names and bare domains usually yield nothing).
+
 Routing between the two:
 - "Who is this LinkedIn person?" -> `intel linkedin <url>` (one profile, corpus-first).
 - "What do they post / what works for them / audit their content" -> content mode.

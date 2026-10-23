@@ -125,6 +125,29 @@ stores an account's posts and answers `corpus profile <url> --json`), point
 `intel linkedin <url>` returns a stored full profile for $0 before paying for a fresh one
 (`--fresh` skips that).
 
+## 🤝 Working together with corpus (optional)
+
+If you run a `corpus`-style back-catalogue CLI (one that answers
+`corpus lookup <query> --json` and `corpus profile <url> --json`) and point
+`INTEL_CORPUS_CMD` / `~/.config/intel/corpus_cmd` at it, the two cooperate:
+
+- **corpus into intel.** Person, company, username and domain runs ask corpus (read-only,
+  free, ~10s timeout) whether the handle, domain or name is already tracked. Matches appear
+  as a "Content (tracked in corpus)" section in the brief and under `content` in `--json`:
+  followers, cadence, formats, top posts, outliers. Profiles intel found that corpus does
+  not track are listed with the exact `intel content add <url> --relationship ...` command.
+  Nothing is ever tracked automatically, since tracking costs money. If corpus is missing,
+  unreachable or slow, the step is skipped (`--verbose` prints one line saying why) and the
+  run carries on. `--no-corpus` turns it off.
+- **Privacy.** Accounts the corpus marks `"private": true` (your own and your clients')
+  are carried as aggregate numbers only. intel never requests private detail and rebuilds
+  such entries from an allow-list, so no post text reaches a brief that a cloud model may
+  read. Anything not clearly public is treated as private.
+- **intel into corpus.** `intel socials <target> --json` prints
+  `[{"platform", "handle", "url", "source"}]` from the modules intel already has (handle
+  search, GitHub profile links, Gravatar), with no extra or paid lookups. A corpus can use it
+  to suggest other profiles of an entity.
+
 ## ⚖️ Ethics & legal
 
 > [!WARNING]

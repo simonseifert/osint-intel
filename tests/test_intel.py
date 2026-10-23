@@ -476,5 +476,178 @@ class CorpusArgv(unittest.TestCase):
                 os.environ["INTEL_CORPUS_CMD"] = orig
 
 
+class CorpusWorkingTogether(unittest.TestCase):
+    """corpus lookup in the brief, the privacy gate, and `intel socials`. The
+    subprocess is mocked and every handle, name and domain is invented."""
+
+    PUB = {"private": False, "platform": "instagram", "handle": "acme_studio",
+           "relationship": "competitor", "url": "https://www.instagram.com/acme_studio/",
+           "followers": 900, "posts_stored": 40, "first_post": "2025-01-01",
+           "last_post": "2026-10-01", "last_synced": "2026-10-22",
+           "cadence_median_days": 3.0, "engagement_median": 25,
+           "top_formats": [{"kind": "image", "posts": 30, "median_engagement": 25}],
+           "top_posts": [{"date": "2026-01-01", "engagement": 300,
+                          "url": "https://www.instagram.com/p/abc/", "opening": "Hello world"}],
+           "recent_outliers": [], "brief_cmd": "corpus brief instagram:acme_studio"}
+    PRIV = {"private": True, "platform": "linkedin", "handle": "jane-example",
+            "relationship": "client", "url": "https://www.linkedin.com/in/jane-example/",
+            "followers": 5, "posts_stored": 3, "engagement_median": 7,
+            "top_posts": [{"date": "2026-01-01", "engagement": 9,
+                           "opening": "SECRET LAUNCH PLAN", "url": "https://x/secret"}],
+            "summary": "SECRET SUMMARY", "top_topics": [{"topic": "SECRET TOPIC"}],
+            "display_name": "Jane Example", "brief_cmd": "corpus brief linkedin:jane-example"}
+
+    def setUp(self):
+        self._run, self._env = intel.subprocess.run, dict(os.environ)
+        os.environ["INTEL_CORPUS_CMD"] = "/opt/corpus"
+        os.environ.pop("INTEL_NO_CORPUS", None)
+        self.calls = []
+
+    def tearDown(self):
+        intel.subprocess.run = self._run
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    def reply(self, matches=None, raises=None, stdout=None):
+        def run(argv, **kw):
+            self.calls.append((argv, kw))
+            if raises:
+                raise raises
+            out = stdout if stdout is not None else json.dumps(
+                {"queries": [], "matches": matches or [], "unmatched": []})
+            return type("R", (), {"stdout": out, "returncode": 0})()
+        intel.subprocess.run = run
+
+    def modules(self):
+        return [{"module": "username", "seed": "acme_studio", "accounts": [
+            {"platform": "Instagram", "url": "https://www.instagram.com/acme_studio/", "weak": False},
+            {"platform": "LinkedIn", "url": "https://www.linkedin.com/in/acme-founder/", "weak": False},
+            {"platform": "Foo", "url": "https://foo.example/", "weak": True}]}]
+
+    def test_lookup_uses_the_corpus_cmd_with_a_short_timeout(self):
+        self.reply([self.PUB])
+        got = intel.corpus_lookup(["acme_studio", "-evil"])
+        self.assertEqual(got["status"], "ok")
+        argv, kw = self.calls[0]
+        self.assertEqual(argv[:4], ["/opt/corpus", "lookup", "--json", "--"])
+        self.assertEqual(argv[4:], ["acme_studio", "-evil"])
+        self.assertLessEqual(kw["timeout"], 10)
+        self.assertNotIn("--include-private", argv)
+
+    def test_section_added_for_username_run_and_untracked_socials_suggested(self):
+        self.reply([self.PUB])
+        c = intel.corpus_section("username", "@acme_studio", self.modules())
+        self.assertEqual([m["handle"] for m in c["matches"]], ["acme_studio"])
+        self.assertEqual(c["matches"][0]["top_posts"][0]["opening"], "Hello world")
+        sug = c["suggestions"]
+        self.assertEqual([(s["platform"], s["handle"]) for s in sug],
+                         [("linkedin", "acme-founder")])
+        self.assertTrue(sug[0]["command"].startswith(
+            "intel content add https://www.linkedin.com/in/acme-founder/ --relationship"))
+
+    def test_private_entries_are_rebuilt_from_aggregates_only(self):
+        self.reply([self.PRIV])
+        c = intel.corpus_section("person", "Jane Example", [])
+        blob = json.dumps(c)
+        for leak in ("SECRET", "x/secret", "opening", "summary", "display_name",
+                     "top_topics"):
+            self.assertNotIn(leak, blob)
+        self.assertNotIn("Jane Example", json.dumps(c["matches"]))
+        m = c["matches"][0]
+        self.assertTrue(m["private"])
+        self.assertEqual(m["top_posts"], [{"date": "2026-01-01", "engagement": 9}])
+        self.assertIn("cloud LLM", m["handling"])
+        buf = io.StringIO()
+        import contextlib
+        with contextlib.redirect_stdout(buf):
+            intel._print_content(c)
+        self.assertNotIn("SECRET", buf.getvalue())
+        self.assertIn("PRIVATE", buf.getvalue())
+
+    def test_private_fails_closed_on_missing_or_wrong_flag(self):
+        for m in ({**self.PUB, "private": None}, {**self.PUB, "relationship": "client"},
+                  {k: v for k, v in self.PUB.items() if k != "private"}):
+            out = intel.sanitize_corpus_match(m)
+            self.assertTrue(out["private"])
+            self.assertNotIn("opening", json.dumps(out))
+        self.assertFalse(intel.sanitize_corpus_match(self.PUB)["private"])
+
+    def test_unreachable_corpus_is_skipped_and_never_fails_the_run(self):
+        import subprocess as sp
+        for kw in ({"raises": sp.TimeoutExpired("ssh", 10)}, {"raises": OSError("no ssh")},
+                   {"stdout": "not json"}, {"stdout": ""}):
+            self.reply(**kw)
+            self.assertEqual(intel.corpus_lookup(["x"])["status"], "unavailable")
+            self.assertIsNone(intel.corpus_section("username", "x", []))
+        os.environ["INTEL_CORPUS_CMD"] = ""
+        os.environ["PATH"] = "/nonexistent"
+        orig = os.path.exists
+        os.path.exists = lambda p: False if "corpus_cmd" in str(p) else orig(p)
+        try:
+            self.assertEqual(intel.corpus_lookup(["x"])["why"], "corpus not configured")
+        finally:
+            os.path.exists = orig
+
+    def test_skip_is_noted_only_when_verbose(self):
+        import contextlib
+        self.reply(raises=OSError("down"))
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            intel.corpus_section("domain", "acme.example", [])
+        self.assertEqual(err.getvalue(), "")
+        os.environ["INTEL_DEBUG"] = "1"
+        with contextlib.redirect_stderr(err):
+            intel.corpus_section("domain", "acme.example", [])
+        self.assertIn("corpus lookup skipped", err.getvalue())
+
+    def test_assemble_attaches_content_and_can_opt_out(self):
+        self.reply([self.PUB])
+        orig = intel.mod_domain
+        intel.mod_domain = lambda q: {"module": "domain", "whois": {}, "subdomains": []}
+        try:
+            res = intel.assemble("acme.example")
+            self.assertEqual(res["content"]["matches"][0]["handle"], "acme_studio")
+            self.assertEqual(self.calls[0][0][-1], "acme.example")
+            self.calls.clear()
+            self.assertNotIn("content", intel.assemble("acme.example", corpus=False))
+            self.assertEqual(self.calls, [])
+        finally:
+            intel.mod_domain = orig
+
+    def test_non_listed_flows_do_not_call_corpus(self):
+        self.reply([self.PUB])
+        orig = intel.mod_email
+        intel.mod_email = lambda q: {"module": "email"}
+        try:
+            self.assertNotIn("content", intel.assemble("a@b.example"))
+        finally:
+            intel.mod_email = orig
+        self.assertEqual(self.calls, [])
+
+    def test_socials_lists_profiles_from_existing_modules_only(self):
+        mods = self.modules() + [{"module": "github", "socials": [
+            {"provider": "twitter", "url": "https://twitter.com/acme_dev"}],
+            "profile": {"login": "acme-dev", "blog": "https://acme.example"}}]
+        got = intel.collect_socials(mods)
+        self.assertEqual([(s["platform"], s["handle"], s["source"]) for s in got], [
+            ("instagram", "acme_studio", "maigret"), ("linkedin", "acme-founder", "maigret"),
+            ("x", "acme_dev", "github profile"), ("github", "acme-dev", "github profile")])
+        for s in got:
+            self.assertEqual(set(s), {"platform", "handle", "url", "source"})
+        orig = intel.assemble
+        intel.assemble = lambda t, **k: {"modules": mods}
+        try:
+            self.assertEqual(intel.socials("@acme_studio"), got)
+        finally:
+            intel.assemble = orig
+
+    def test_social_from_url(self):
+        f = intel.social_from_url
+        self.assertEqual(f("https://www.linkedin.com/company/Acme-Co/"), ("linkedin", "acme-co"))
+        self.assertEqual(f("https://www.tiktok.com/@acme.tok"), ("tiktok", "acme.tok"))
+        self.assertIsNone(f("https://www.instagram.com/p/xyz/"))
+        self.assertIsNone(f("https://acme.example/in/x"))
+
+
 if __name__ == "__main__":
     unittest.main()
