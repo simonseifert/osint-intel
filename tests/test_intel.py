@@ -726,6 +726,13 @@ class FreshFactsTests(unittest.TestCase):
     def test_locations_never_reach_private_hosts(self):
         for h in ("localhost", "127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.169.254", "::1"):
             self.assertFalse(intel._public_host(h), h)
+        for a in ("64:ff9b::a00:1", "64:ff9b:1::a00:1", "::ffff:10.0.0.1", "2002:a00:1::1",
+                  "2001:0:4136:e378:8000:63bf:f5ff:fffe", "::a00:1", "fe80::1", "fc00::1"):
+            self.assertFalse(intel._public_ip(a), a)
+        self.assertTrue(intel._public_ip("1.1.1.1"))
+        self.assertTrue(intel._public_ip("2606:4700:4700::1111"))
+        with self.assertRaises(OSError):  # the connect step re-checks, whatever was checked before
+            intel._pinned_connect(("127.0.0.1", 80), 2)
         out = intel.site_locations("127.0.0.1")
         self.assertEqual(out["pages"], [])
         self.assertIn("refused", out["note"])

@@ -57,6 +57,7 @@ import contextlib
 import difflib
 import glob
 import hashlib
+import http.client
 import io
 import ipaddress
 import json
@@ -703,20 +704,68 @@ def _extract_locations(text, page):
     return locs
 
 
-def _public_host(host):
-    """True only if every address the host resolves to is public internet. The domain
-    comes from register data anyone can file, so it must never reach the local network."""
-    try:
-        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
-    except (OSError, UnicodeError):
-        return False
-    for info in infos:
-        ip = ipaddress.ip_address(info[4][0].split("%")[0])
-        if getattr(ip, "ipv4_mapped", None):
-            ip = ip.ipv4_mapped
-        if not ip.is_global or ip.is_multicast or ip.is_reserved:
+def _public_ip(addr):
+    """Allowlist, not denylist: global unicast only. IPv6 forms that wrap an IPv4
+    address (mapped, 6to4, Teredo) are judged by the wrapped address; NAT64 is refused."""
+    ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    if ip.version == 6:
+        if ip in ipaddress.ip_network("64:ff9b::/96") or ip in ipaddress.ip_network("64:ff9b:1::/48"):
             return False
-    return bool(infos)
+        inner = ip.ipv4_mapped or ip.sixtofour or (ip.teredo[1] if ip.teredo else None)
+        if inner is not None:
+            ip = inner
+        elif ip not in ipaddress.ip_network("2000::/3"):
+            return False
+    return ip.is_global and not (ip.is_multicast or ip.is_reserved)
+
+
+def _public_addrs(host, port=443):
+    """The host's addresses if ALL are public, else []. The domain comes from register
+    data anyone can file, so it must never reach the local network."""
+    try:
+        addrs = sorted({ai[4][0] for ai in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)})
+    except (OSError, UnicodeError):
+        return []
+    return addrs if addrs and all(_public_ip(a) for a in addrs) else []
+
+
+def _public_host(host):
+    return bool(host) and bool(_public_addrs(host))
+
+
+def _pinned_connect(address, timeout=socket._GLOBAL_DEFAULT_TIMEOUT, source_address=None, **kw):
+    """Resolve once, check, and connect to that same address: a DNS-rebinding host
+    cannot pass the check with one answer and be fetched at another. TLS still
+    verifies the hostname (SNI and the certificate use the connection's host)."""
+    host, port = address
+    addrs = _public_addrs(host, port)
+    if not addrs:
+        raise OSError(f"refused {host}: not public internet addresses only")
+    err = None
+    for a in addrs:
+        try:
+            return socket.create_connection((a, port), timeout, source_address)
+        except OSError as e:
+            err = e
+    raise err
+
+
+class _PinnedHTTP(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        class Conn(http.client.HTTPConnection):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self._create_connection = _pinned_connect
+        return self.do_open(Conn, req)
+
+
+class _PinnedHTTPS(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        class Conn(http.client.HTTPSConnection):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                self._create_connection = _pinned_connect
+        return self.do_open(Conn, req, context=self._context)
 
 
 class _PublicOnlyRedirects(_HttpOnlyRedirects):
@@ -727,7 +776,9 @@ class _PublicOnlyRedirects(_HttpOnlyRedirects):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
-_PUBLIC_OPENER = urllib.request.build_opener(_PublicOnlyRedirects)
+# ProxyHandler({}): an env proxy would resolve the host itself and bypass the pinning.
+_PUBLIC_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _PublicOnlyRedirects,
+                                             _PinnedHTTP, _PinnedHTTPS)
 
 
 def _fetch_public(url, timeout=20):
