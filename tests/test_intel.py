@@ -723,6 +723,15 @@ class FreshFactsTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 intel._site_root(bad)
 
+    def test_locations_never_reach_private_hosts(self):
+        for h in ("localhost", "127.0.0.1", "10.0.0.1", "192.168.1.1", "169.254.169.254", "::1"):
+            self.assertFalse(intel._public_host(h), h)
+        out = intel.site_locations("127.0.0.1")
+        self.assertEqual(out["pages"], [])
+        self.assertIn("refused", out["note"])
+        with self.assertRaises(ValueError):
+            intel._fetch_public("http://192.168.1.1/")
+
     def test_company_domain_skips_free_mail(self):
         m = {"emails": ["a@gmail.com", "b@firma.hr", "c@firma.hr"]}
         self.assertEqual(intel.company_domain(m), "firma.hr")

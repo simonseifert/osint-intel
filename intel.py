@@ -58,11 +58,13 @@ import difflib
 import glob
 import hashlib
 import io
+import ipaddress
 import json
 import os
 import re
 import shlex
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -701,6 +703,45 @@ def _extract_locations(text, page):
     return locs
 
 
+def _public_host(host):
+    """True only if every address the host resolves to is public internet. The domain
+    comes from register data anyone can file, so it must never reach the local network."""
+    try:
+        infos = socket.getaddrinfo(host, 443, proto=socket.IPPROTO_TCP)
+    except (OSError, UnicodeError):
+        return False
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0].split("%")[0])
+        if getattr(ip, "ipv4_mapped", None):
+            ip = ip.ipv4_mapped
+        if not ip.is_global or ip.is_multicast or ip.is_reserved:
+            return False
+    return bool(infos)
+
+
+class _PublicOnlyRedirects(_HttpOnlyRedirects):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if not _public_host(urllib.parse.urlparse(newurl).hostname or ""):
+            raise urllib.error.HTTPError(newurl, code, "blocked redirect to non-public host",
+                                         headers, fp)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+_PUBLIC_OPENER = urllib.request.build_opener(_PublicOnlyRedirects)
+
+
+def _fetch_public(url, timeout=20):
+    """_fetch_final, but only to public hosts, re-checked on every redirect hop."""
+    if not _public_host(urllib.parse.urlparse(url).hostname or ""):
+        raise ValueError("refusing a non-public host")
+    req = urllib.request.Request(url, headers=dict(_BROWSER_UA))
+    try:
+        with _PUBLIC_OPENER.open(req, timeout=timeout) as r:
+            return r.status, r.geturl(), r.read(4 * 1024 * 1024).decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.geturl(), e.read(512 * 1024).decode("utf-8", "replace")
+
+
 def _site_root(site):
     site = site.strip()
     if "@" in site and "/" not in site:
@@ -728,9 +769,12 @@ def site_locations(site, match=None, max_pages=4):
         out["note"] = str(e)
         return out
     out["site"] = root
+    if not _public_host(urllib.parse.urlparse(root).hostname):
+        out["note"] = "refused: host does not resolve to public internet addresses only"
+        return out
     host = _registrable(root)
     try:
-        st, final, body = _fetch_final(root + (path or "/"))
+        st, final, body = _fetch_public(root + (path or "/"))
     except Exception as e:  # noqa: BLE001
         out["note"] = f"home page: {str(e)[:150]}"
         return out
@@ -746,11 +790,11 @@ def site_locations(site, match=None, max_pages=4):
     for url in cands[:max_pages] or [final]:
         locs, via = [], "raw"
         try:
-            st, _, b = _fetch_final(url)
+            st, _, b = _fetch_public(url)
             locs = _extract_locations(_page_segments(b), url) if st == 200 else []
         except Exception:  # noqa: BLE001
             st = None
-        if not locs and not out["locations"]:  # JS-only store finder: read it rendered
+        if not locs and not out["locations"] and st is not None:  # JS-only store finder
             try:
                 md = _get("https://r.jina.ai/" + url, headers={"Accept": "text/plain"},
                           timeout=40).decode("utf-8", "replace")
