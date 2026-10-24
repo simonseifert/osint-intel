@@ -682,5 +682,52 @@ class CorpusWorkingTogether(unittest.TestCase):
         self.assertNotIn("\x1b", json.dumps(m["top_posts"]))
 
 
+class FreshFactsTests(unittest.TestCase):
+    BLOCKED = ("Hrvatska | - U blokadi | Aktivan - U blokadi | OIB | 12345678903 | Računi | U blokadi | 2026 | "
+               "Porezni dug | Nema poreznog duga | Sudske objave | Nije u postupku | Neisplaćene plaće | "
+               "Uredno | Status bankovnog računa | IBAN | HR1210010051863000160 | 30.10.2006. | - | "
+               "PRVA BANKA d.d. | Blokiran | Datum otvaranja računa | 30.10.2006. | "
+               "Posljednji put provjerena blokada: | 23.10.2026.")
+
+    def test_blocked_page(self):
+        b = intel.parse_blockade(self.BLOCKED)
+        self.assertIs(b["blocked"], True)
+        self.assertEqual(b["blocked_year"], "2026")
+        self.assertEqual(b["source_checked"], "23.10.2026")
+        self.assertEqual(b["accounts"][0]["status"], "Blokiran")
+        self.assertEqual(b["court_notices"], "Nije u postupku")
+
+    def test_not_blocked_page_and_conflict(self):
+        ok = self.BLOCKED.replace("Računi | U blokadi | 2026", "Računi | Nije u blokadi")
+        self.assertIs(intel.parse_blockade(ok.replace("Blokiran", "Aktivan"))["blocked"], False)
+        # summary says fine but an account is blocked: blocked wins, conflict flagged
+        b = intel.parse_blockade(ok)
+        self.assertIs(b["blocked"], True)
+        self.assertTrue(b["conflict"])
+
+    def test_unrecognised_page_gives_no_verdict(self):
+        self.assertIsNone(intel.parse_blockade("Prijava | Email | Lozinka")["blocked"])
+
+    def test_addresses_from_official_page(self):
+        t = ("Nedjeljom ne radimo! | Koprivnica | Radnička cesta 23 | 48000 Koprivnica | Radno vrijeme: PON | "
+             "Zagreb-Kustošija Ilica 265 10000, Zagreb Hrvatska Radno vrijeme | Tel 01 4343 116")
+        locs = intel._extract_locations(t, "https://x.example/poslovnice")
+        got = {(x["postcode"], x["city"]) for x in locs}
+        self.assertEqual(got, {("48000", "Koprivnica"), ("10000", "Zagreb")})
+        self.assertTrue(any(x["street"].endswith("Radnička cesta 23") for x in locs))
+
+    def test_site_root_refuses_odd_urls(self):
+        self.assertEqual(intel._site_root("firma.hr")[0], "https://firma.hr")
+        self.assertEqual(intel._site_root("ana@firma.hr")[0], "https://firma.hr")
+        for bad in ("http://user@host.hr/", "https://host.hr:8080/", "file:///etc/passwd"):
+            with self.assertRaises(ValueError):
+                intel._site_root(bad)
+
+    def test_company_domain_skips_free_mail(self):
+        m = {"emails": ["a@gmail.com", "b@firma.hr", "c@firma.hr"]}
+        self.assertEqual(intel.company_domain(m), "firma.hr")
+        self.assertIsNone(intel.company_domain({"emails": ["x@net.hr"]}))
+
+
 if __name__ == "__main__":
     unittest.main()

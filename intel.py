@@ -25,6 +25,13 @@ Pivots (keyless):
                                           sun/shadow geometry; bearing -> UTC time bands
     intel <github-url | discord-id>       GitHub exposure audit / snowflake account date
 
+Live facts (fetched now, timestamped; "unknown" instead of a guessed negative):
+    intel blockade <OIB | "Firma d.o.o.">  HR account blockade, per account, tax debt,
+                                          court notices (CompanyWall, data from FINA)
+    intel locations <domain> [city]       branches/addresses as the company's own site
+                                          lists them; with a city: listed or not
+    Company runs add both for the top Croatian register match.
+
 Deep (paid) LinkedIn on demand:
     intel linkedin <profile-or-company-url>     corpus ($0) -> HarvestAPI ($0.004)
                    [--fresh]                    -> Apify; prints vendor and cost
@@ -577,6 +584,203 @@ def mod_company(q):
                    "national registers (Croatia sudreg, France recherche-entreprises, GLEIF), "
                    "domain module on their site, and LinkedIn via `intel linkedin`.")
     return out
+
+
+# ---------------- fresh facts: account blockade + branches from the official site ----------------
+# Volatile facts (is the account blocked today, did a branch open last week) are where
+# search summaries and model memory fail. Both checks below read the live page, stamp
+# the fetch time, and report "unknown" rather than a guessed negative.
+
+_CW = "https://www.companywall.hr"
+
+
+def _now_utc():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def _page_segments(body):
+    """Visible text of an HTML page, one ' | ' per tag boundary (keeps fields apart).
+    Tags are stripped again after unescaping: some CMSs ship their content as escaped HTML."""
+    body = re.sub(r"<(script|style|noscript)\b.*?</\1>", " ", body, flags=re.S | re.I)
+    s = re.sub(r"<[^>]+>", "\n", html_unescape(re.sub(r"<[^>]+>", "\n", body)))
+    s = re.sub(r"[ \t\xa0]+", " ", s)
+    return " | ".join(x.strip() for x in s.split("\n") if x.strip())
+
+
+def parse_blockade(text):
+    """CompanyWall company page text -> blockade facts. None where the page says nothing."""
+    def one(rx):
+        m = re.search(rx, text)
+        return m.group(1).strip() if m else None
+    summary = one(r"Računi \| (U blokadi|Nije u blokadi)\b")
+    year = one(r"Računi \| U blokadi \| (\d{4})\b")
+    accounts = {}
+    for iban, opened, closed, bank, st in re.findall(
+            r"IBAN \| (HR\d{19}) \| ([\d.]+) \| (-|[\d.]+) \| ([^|]+?) \| ([^|]+?) \| Datum otvaranja",
+            text):
+        accounts.setdefault(iban, {"iban": iban, "bank": bank.strip(), "status": st.strip(),
+                                   "opened": opened.rstrip("."),
+                                   "closed": None if closed == "-" else closed.rstrip(".")})
+    accounts = list(accounts.values())
+    any_blocked = any(a["status"].lower().startswith("blokiran") for a in accounts)
+    if summary == "U blokadi" or any_blocked:
+        blocked = True
+    elif summary == "Nije u blokadi":
+        blocked = False
+    else:
+        blocked = None  # fail closed: no explicit statement, no verdict
+    return {"blocked": blocked, "summary": summary, "blocked_year": year,
+            "accounts": accounts,
+            "conflict": bool(summary == "Nije u blokadi" and any_blocked),
+            "source_checked": (one(r"Posljednji put provjerena blokada: \| ([\d.]+)") or "").rstrip(".")
+            or None,
+            "tax_debt": one(r"Porezni dug \| ([^|]+)"),
+            "court_notices": one(r"Sudske objave \| ((?:Nije|Postoje|U postupku)[^|]*)"),
+            "unpaid_wages": one(r"Neisplaćene plaće \| ([^|]+)")}
+
+
+def hr_blockade(q):
+    """Live account-blockade status of a Croatian business (OIB, or a name sudreg resolves).
+    Read from CompanyWall's free page, which republishes FINA's register data and states
+    when it last checked; fetched now, never cached."""
+    out = {"source": "companywall.hr (account data from FINA)", "status": "unknown",
+           "fetched_at": _now_utc(), "oib": None, "url": None}
+    oib = q.strip() if valid_oib(q.strip()) else None
+    if not oib:
+        hits = sudreg(q, limit=1).get("matches") or []
+        oib = hits[0]["oib"] if hits else None
+        if hits:
+            out["name"] = hits[0]["name"]
+    if not oib:
+        out["note"] = "needs an OIB or a name the court register resolves"
+        return out
+    out["oib"] = oib
+    try:
+        st, _, body = _fetch_final(f"{_CW}/pretraga?n={oib}")
+        m = re.search(r'href="(/tvrtka/[a-z0-9-]+/[A-Za-z0-9]+)"', body)
+        if st != 200 or not m:
+            out["note"] = f"no CompanyWall page found for OIB {oib} (HTTP {st})"
+            return out
+        out["url"] = _CW + m.group(1)
+        st, _, body = _fetch_final(out["url"])
+        text = _page_segments(body)
+        if st != 200 or f"OIB | {oib}" not in text:
+            out["note"] = f"page did not confirm OIB {oib} (HTTP {st})"
+            return out
+        out.update(parse_blockade(text))
+        out["status"] = "ok" if out["blocked"] is not None else "unknown"
+        if out["blocked"] is None:
+            out["note"] = "page layout not recognised: no verdict (check the url by hand)"
+    except Exception as e:  # noqa: BLE001
+        out.update(status="failed", note=str(e)[:200])
+    return out
+
+
+_LOC_HINT = re.compile(r"poslovnic|lokacij|trgovin|prodajn|salon|centr|store|location|filial|"
+                       r"standort|kontakt|contact", re.I)
+_LOC_RANK = re.compile(r"poslovnic|lokacij|trgovin|prodajn|store|location|filial|standort", re.I)
+# "Radnička cesta 23 48000 Koprivnica" / "Ilica 265 10000, Zagreb": street ending in a
+# house number, then a Croatian postcode (10xxx-53xxx), then the place name.
+_W = r"[A-ZČĆĐŠŽa-zčćđšž][\w.čćđšžČĆĐŠŽ'-]*"
+_HR_ADDRESS = re.compile(rf"((?:{_W} ){{1,5}}\d{{1,4}}[a-zA-Z]?)[ ,|]+"
+                         r"((?:1\d|2\d|3\d|4\d|5[0-3])\d{3})[ ,|]+"
+                         r"([A-ZČĆĐŠŽ][a-zčćđšž]+(?:[ -][A-ZČĆĐŠŽ][a-zčćđšž]+){0,2})")
+_NOT_PLACE = re.compile(r"\s(Hrvatska|Croatia|Radno|Tel|Telefon|Mob|Fax|Kontakt|Email|E-mail|"
+                        r"Pon|Ponedjeljak|Otvoreno|Info)\b.*$")
+_FREE_MAIL = {"gmail.com", "yahoo.com", "hotmail.com", "outlook.com", "icloud.com", "live.com",
+              "net.hr", "inet.hr", "t-com.hr", "vip.hr", "gmx.net", "gmx.de", "protonmail.com"}
+
+
+def _extract_locations(text, page):
+    locs = []
+    flat = re.sub(r"\s*\|\s*", " | ", text)
+    for m in _HR_ADDRESS.finditer(flat):
+        street = re.sub(r"\s*\|\s*", " ", m.group(1)).strip()
+        city = _NOT_PLACE.sub("", m.group(3)).strip()
+        locs.append({"street": street, "postcode": m.group(2), "city": city, "page": page})
+    return locs
+
+
+def _site_root(site):
+    site = site.strip()
+    if "@" in site and "/" not in site:
+        site = site.split("@", 1)[1]
+    if "://" in site and not site.lower().startswith(("http://", "https://")):
+        raise ValueError("expected a plain domain or http(s) URL")
+    if not site.lower().startswith(("http://", "https://")):
+        site = "https://" + site
+    u = urllib.parse.urlparse(site)
+    if not u.hostname or u.port or u.username:
+        raise ValueError("expected a plain domain or http(s) URL")
+    return f"{u.scheme}://{u.hostname}", u.path if u.path not in ("", "/") else ""
+
+
+def site_locations(site, match=None, max_pages=4):
+    """Branches/addresses as the company's OWN website lists them right now. Finds the
+    store/branch/contact pages from the home page, reads them raw, and falls back to a
+    rendered read (r.jina.ai) when a page only fills in with JavaScript. `match` narrows
+    to one city or street and answers it explicitly (found / not found on these pages)."""
+    out = {"source": "official website", "fetched_at": _now_utc(), "status": "failed",
+           "site": None, "pages": [], "locations": []}
+    try:
+        root, path = _site_root(site)
+    except ValueError as e:
+        out["note"] = str(e)
+        return out
+    out["site"] = root
+    host = _registrable(root)
+    try:
+        st, final, body = _fetch_final(root + (path or "/"))
+    except Exception as e:  # noqa: BLE001
+        out["note"] = f"home page: {str(e)[:150]}"
+        return out
+    cands = [final] if path else []
+    for href in re.findall(r'href="([^"#]+)"', body, re.I):
+        url = urllib.parse.urljoin(final, html_unescape(href))
+        if (url.startswith(("http://", "https://")) and _registrable(url) == host
+                and _LOC_HINT.search(urllib.parse.urlparse(url).path)):
+            cands.append(url.split("?")[0].rstrip("/"))
+    cands = sorted(dict.fromkeys(cands), key=lambda u: (u != final if path else False,
+                                                         not _LOC_RANK.search(u), len(u)))
+    seen = set()
+    for url in cands[:max_pages] or [final]:
+        locs, via = [], "raw"
+        try:
+            st, _, b = _fetch_final(url)
+            locs = _extract_locations(_page_segments(b), url) if st == 200 else []
+        except Exception:  # noqa: BLE001
+            st = None
+        if not locs and not out["locations"]:  # JS-only store finder: read it rendered
+            try:
+                md = _get("https://r.jina.ai/" + url, headers={"Accept": "text/plain"},
+                          timeout=40).decode("utf-8", "replace")
+                txt = " | ".join(x.strip(" #*") for x in md.splitlines() if x.strip(" #*"))
+                locs, via = _extract_locations(txt, url), "rendered (r.jina.ai)"
+            except Exception:  # noqa: BLE001
+                pass
+        out["pages"].append({"url": url, "http": st, "via": via, "addresses": len(locs)})
+        for loc in locs:
+            k = (loc["postcode"], loc["street"].lower(), loc["city"].lower())
+            if k not in seen:
+                seen.add(k)
+                out["locations"].append(loc)
+    out["status"] = "ok" if out["pages"] else "failed"
+    if match:
+        f = _ascii_fold(match).lower()
+        hit = [x for x in out["locations"]
+               if f in _ascii_fold(f"{x['street']} {x['postcode']} {x['city']}").lower()]
+        out["match"] = {"query": match, "found": bool(hit), "locations": hit}
+        if not hit:
+            out["match"]["note"] = (f"not listed on the {len(out['pages'])} page(s) read at "
+                                    f"{out['fetched_at']}; that is not proof it does not exist")
+    return out
+
+
+def company_domain(match):
+    """The company's own domain from its registered emails (free-mail hosts skipped)."""
+    doms = [e.rsplit("@", 1)[1].lower() for e in match.get("emails") or [] if "@" in e]
+    doms = [d for d in doms if d not in _FREE_MAIL]
+    return max(set(doms), key=doms.count) if doms else None
 
 
 def news(query, maxrecords=20):
@@ -2164,6 +2368,11 @@ def assemble(query, deep=False, region=None, corpus=True):
         res["modules"].append(comp)
         # an OIB is not a press term: search news for the name the register resolved
         hits = (comp.get("sudreg") or {}).get("matches") or []
+        if hits:  # live, timestamped facts for the top register match only
+            dom = company_domain(hits[0])
+            comp["fresh"] = {"for": f"{hits[0]['name']} (OIB {hits[0]['oib']})",
+                             "blockade": hr_blockade(hits[0]["oib"]),
+                             "locations": site_locations(dom) if dom else None}
         name = hits[0]["name"] if valid_oib(query) and hits else query
         if not valid_oib(name):
             res["modules"].append(mod_news(name))
@@ -2383,6 +2592,7 @@ def _print(res):
                 print(f"    {c.get('court')} · statements filed: "
                       f"{c['financial_statements_years']} · last change {c['last_change']}"
                       + (f" · email {', '.join(c['emails'])}" if c["emails"] else ""))
+            _print_fresh(m.get("fresh"))
             print("  " + m["hint"])
         elif mod == "github":
             if m.get("status") != "found":
@@ -2433,6 +2643,55 @@ def _print(res):
         _print_content(res["content"])
 
 
+def _print_blockade(b, indent="  "):
+    if b.get("status") != "ok":
+        print(f"{indent}blockade: UNKNOWN ({b.get('note') or b.get('status')}) "
+              f"· fetched {b['fetched_at']}" + (f" · {b['url']}" if b.get("url") else ""))
+        return
+    verdict = "BLOCKED" if b["blocked"] else "not blocked"
+    if b.get("blocked") and b.get("blocked_year"):
+        verdict += f" ({b['blocked_year']})"
+    print(f"{indent}blockade: {verdict} · source last checked {b.get('source_checked') or '?'} "
+          f"· fetched {b['fetched_at']} · {b['source']}")
+    if b.get("conflict"):
+        print(f"{indent}  ! summary says not blocked but an account is marked blocked")
+    for a in b.get("accounts") or []:
+        print(f"{indent}  {a['iban']}  {a['bank']}  {a['status']}"
+              + (f" (closed {a['closed']})" if a.get("closed") else ""))
+    extra = " · ".join(f"{k}: {b[k]}" for k in ("tax_debt", "court_notices", "unpaid_wages")
+                       if b.get(k))
+    if extra:
+        print(f"{indent}  {extra}")
+    print(f"{indent}  {b['url']}")
+
+
+def _print_locations(loc, indent="  "):
+    if not loc:
+        return
+    if loc.get("status") != "ok":
+        print(f"{indent}official-site locations: {loc.get('status')} {loc.get('note') or ''}")
+        return
+    print(f"{indent}official-site locations ({loc['site']}, fetched {loc['fetched_at']}): "
+          f"{len(loc['locations'])} address(es) on {len(loc['pages'])} page(s)")
+    for x in loc["locations"][:40]:
+        print(f"{indent}  {x['street'] + ', ' if x['street'] else ''}{x['postcode']} {x['city']}")
+    if len(loc["locations"]) > 40:
+        print(f"{indent}  ... {len(loc['locations']) - 40} more (--json)")
+    for pg in loc["pages"]:
+        print(f"{indent}  read: {pg['url']} [{pg['via']}, {pg['addresses']}]")
+    mt = loc.get("match")
+    if mt:
+        print(f"{indent}  '{mt['query']}': " + ("LISTED" if mt["found"] else mt["note"]))
+
+
+def _print_fresh(fr):
+    if not fr:
+        return
+    print(f"  live check for {fr['for']}:")
+    _print_blockade(fr["blockade"], "    ")
+    _print_locations(fr.get("locations"), "    ")
+
+
 def main(argv=None):
     argv = argv if argv is not None else sys.argv[1:]
     as_json = "--json" in argv
@@ -2456,6 +2715,19 @@ def main(argv=None):
     if a[0] == "socials" and len(a) > 1:
         # A bare JSON list, whatever the flags: it is the machine contract corpus reads.
         print(_clean(json.dumps(socials(" ".join(a[1:])), indent=2, ensure_ascii=False)))
+        return
+    if a[0] in ("blockade", "locations") and len(a) > 1:
+        if a[0] == "blockade":
+            out = hr_blockade(" ".join(a[1:]))
+        else:
+            out = site_locations(a[1], match=" ".join(a[2:]) or None)
+        if as_json:
+            print(_clean(json.dumps(out, indent=2, ensure_ascii=False)))
+            return
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            (_print_blockade if a[0] == "blockade" else _print_locations)(out, "")
+        sys.stdout.write(_clean(buf.getvalue()).replace("\r", ""))
         return
     if a[0] == "linkedin" and len(a) > 1:
         out = linkedin(a[1], fresh="--fresh" in argv)

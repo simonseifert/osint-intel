@@ -48,6 +48,9 @@ Keep a scratchpad table as you go: `finding | source | confidence | pivots it op
 - **domain.com** -> RDAP whois + crt.sh subdomains + oldest Wayback snapshot (public age).
 - **"Acme Ltd"** (company) -> GLEIF entity + LEI + auto news (legal suffix stripped for
   the press query; GDELT, falling back to Google News RSS when GDELT 429s or is empty).
+  Croatian companies (name or OIB) also get the court register (sudreg) and a live check
+  of the top match: account blockade and the branch addresses on its own website.
+  Standalone: `intel blockade <OIB|name>`, `intel locations <domain> [city]`.
 - **"a person + clues"** -> news pivot + tells you to run the akinator loop (below).
 - **github.com/<user>** -> GitHub exposure audit (profile, linked socials, orgs, GPG-key
   emails, SSH key count, author identities in its own commits: real address vs noreply)
@@ -293,6 +296,30 @@ the brief **displays**.
 **Display:** put the headshot + notable images into the brief (embed via `intel embed`),
 list the key clips with links. Keep captions factual and sourced.
 
+## Fresh facts: never answer volatile questions from memory or a search summary
+
+AI summaries (Google's, ours, any model's memory) are weakest on what changed recently:
+is the account blocked today, did a branch just open, is it in stock, has someone died,
+yesterday's price. Two real misses from one week in Croatia: an AI summary said a retailer
+had no branch in a town where it had just opened one (the branch was on the company's own
+store page), and said a college was not in blockade a day after FINA listed it.
+
+- **Ask the primary source, now.** Blockade: `intel blockade <OIB|name>` (per-account
+  status from FINA's data, the source's own "last checked" date, tax debt, court notices,
+  unpaid wages). Branches / addresses: `intel locations <domain> [city]` reads the
+  company's own store/branch/contact pages (raw, then rendered if the page is
+  JavaScript-only). Register status: sudreg. Company runs add blockade + locations for
+  the top register match automatically.
+- **Every volatile fact carries its source and fetch time** in the brief ("not blocked,
+  FINA via CompanyWall, source checked 23.10.2026, fetched 24.10.2026 18:23 UTC").
+- **Negatives are the dangerous ones.** Never write "has no branch in X" or "is not
+  blocked" from absence in search results. Write what was checked: "not listed on the 4
+  official pages read at <time>". An `unknown` from the tool stays unknown in the brief.
+- **Conflicting sources:** the primary source wins over an aggregator, the newer fetch
+  over the older, and the conflict is reported, not smoothed over.
+- Not covered yet (say so instead of guessing): stock levels, live prices, deaths. For
+  those, fetch the shop's product page / an official notice and cite it with the time.
+
 ## Verification: the truth factor (assume adversarial input)
 
 The system can be fed lies. Someone can plant a fake profile, seed a false news story, run
@@ -467,7 +494,10 @@ dossier. Offer the PDF; do not always generate it.
   - `sukobinteresa.hr` - officials' asset declarations (public office holders only).
   - `companywall.hr/tvrtka/...`, `fininfo.hr/Poduzece/...` - single company pages (OIB,
     status) return 200; fetch one page on demand, never crawl (robots blocks search and
-    owner graphs). `poslovna.hr` is login/trial only.
+    owner graphs). `poslovna.hr` is login/trial only. **Blockade: WIRED** as
+    `intel blockade` (CompanyWall's free page republishes FINA's per-account status and
+    its last-checked date; Fina's own Info.BIZ hides it behind a subscription, and the
+    official JRR register and the 818058 SMS are paid).
   - **sudreg (court register): WIRED.** `intel "Firma d.o.o."` or a bare OIB
     (`intel 81793146560`, checksum-validated) returns name, short name, OIB/MBS, legal
     form, active/bankruptcy/liquidation flags, founding date, seat address, court, NKD,
